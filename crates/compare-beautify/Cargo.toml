@@ -1,0 +1,6 @@
+[package]
+name = "compare-beautify"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

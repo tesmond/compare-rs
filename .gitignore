@@ -1,0 +1,36 @@
+# Rust build output (also holds the app bundle and disk image from `make`)
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is committed on purpose: this is an application.
+
+# macOS packaging leftovers if a build is interrupted
+*.iconset/
+*.dmg
+
+# Profiling and coverage output
+*.profraw
+*.profdata
+perf.data*
+flamegraph.svg
+*.trace/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.zed/
+
+# Local environment and tool settings
+.env
+.env.*
+.claude/settings.local.json

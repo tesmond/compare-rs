@@ -1,0 +1,6 @@
+[package]
+name = "compare-syntax"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

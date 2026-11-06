@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/compare-core",
+    "crates/compare-syntax",
+    "crates/compare-diff",
+    "crates/compare-archive",
+    "crates/compare-beautify",
+    "crates/compare-app",
+]
+default-members = ["crates/compare-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+compare-archive = { path = "crates/compare-archive" }
+compare-beautify = { path = "crates/compare-beautify" }
+compare-core = { path = "crates/compare-core" }
+compare-diff = { path = "crates/compare-diff" }
+compare-syntax = { path = "crates/compare-syntax" }
+bzip2 = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+flate2 = "1.0"
+gpui = "0.2.2"
+gpui-component = { version = "=0.5.1", default-features = false }
+memchr = "2.7"
+rayon = "1.10"
+rustc-hash = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tar = "0.4"
+tempfile = "3.10"
+thiserror = "2.0"
+unicode-segmentation = "1.12"
+xz2 = "0.1"
+zip = { version = "2.2", default-features = false, features = ["deflate", "bzip2"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev.package."*"]
+# Dependencies (notably GPUI) are far too slow unoptimized.
+opt-level = 2

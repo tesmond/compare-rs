@@ -1,0 +1,13 @@
+[package]
+name = "compare-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+compare-archive.workspace = true
+compare-beautify.workspace = true
+compare-diff.workspace = true
+memchr.workspace = true
+rayon.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true

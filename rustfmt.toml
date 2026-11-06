@@ -1,0 +1,8 @@
+# Google Rust style: https://google.github.io/styleguide/rustguide.html
+max_width = 100
+use_small_heuristics = "Max"
+# The following options are nightly-only; they apply when formatting with
+# `cargo +nightly fmt` and are ignored (with a warning) on stable.
+# hex_literal_case = "Lower"
+# format_macro_matchers = true
+# imports_granularity = "Module"
