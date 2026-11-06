@@ -107,6 +107,27 @@ pub struct FolderStats {
     pub errors: usize,
 }
 
+impl FolderStats {
+    fn count(&mut self, status: FolderStatus) -> &mut usize {
+        match status {
+            FolderStatus::Identical => &mut self.identical,
+            FolderStatus::Different => &mut self.different,
+            FolderStatus::LeftOnly => &mut self.left_only,
+            FolderStatus::RightOnly => &mut self.right_only,
+            FolderStatus::Error => &mut self.errors,
+        }
+    }
+
+    fn add(&mut self, status: FolderStatus) {
+        *self.count(status) += 1;
+    }
+
+    fn remove(&mut self, status: FolderStatus) {
+        let count = self.count(status);
+        *count = count.saturating_sub(1);
+    }
+}
+
 /// Progress shared between a running folder comparison and the UI.
 #[derive(Debug, Default)]
 pub struct FolderProgress {
@@ -153,6 +174,79 @@ impl FolderComparison {
 
     pub fn right_path(&self, node: &FolderNode) -> PathBuf {
         self.right_root.join(&node.relative_path)
+    }
+
+    /// Re-checks the file pair that includes `path` (on either side) after
+    /// it changed, updating its status, the counts, and the status of the
+    /// folders above it. Returns true if a matching pair was found.
+    pub fn refresh_file(&mut self, path: &Path) -> bool {
+        let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let target = canonical(path);
+        let Some(index) = (0..self.nodes.len()).find(|&index| {
+            let node = &self.nodes[index];
+            node.is_file_pair()
+                && (canonical(&self.left_path(node)) == target
+                    || canonical(&self.right_path(node)) == target)
+        }) else {
+            return false;
+        };
+        let (left_path, right_path) =
+            (self.left_path(&self.nodes[index]), self.right_path(&self.nodes[index]));
+        let (left, right) = (entry_meta(&left_path), entry_meta(&right_path));
+        let status = if left.kind != right.kind {
+            FolderStatus::Different
+        } else {
+            compare_file_contents(&left_path, &right_path, left, right, &FolderProgress::default())
+        };
+        let node = &mut self.nodes[index];
+        self.stats.remove(node.status);
+        self.stats.add(status);
+        node.status = status;
+        node.left = Some(left);
+        node.right = Some(right);
+
+        // Folders present on both sides summarize their contents.
+        for &ancestor in self.ancestors(index).iter().rev() {
+            let node = &self.nodes[ancestor];
+            let both_dirs = node
+                .left
+                .zip(node.right)
+                .is_some_and(|(l, r)| l.kind == EntryKind::Dir && r.kind == EntryKind::Dir);
+            if both_dirs && node.status != FolderStatus::Error {
+                let identical = node
+                    .children
+                    .iter()
+                    .all(|&child| self.nodes[child].status == FolderStatus::Identical);
+                self.nodes[ancestor].status =
+                    if identical { FolderStatus::Identical } else { FolderStatus::Different };
+            }
+        }
+        true
+    }
+
+    /// The folders containing node `index`, outermost first.
+    fn ancestors(&self, index: usize) -> Vec<usize> {
+        fn search(
+            nodes: &[FolderNode],
+            within: &[usize],
+            target: usize,
+            path: &mut Vec<usize>,
+        ) -> bool {
+            for &child in within {
+                if child == target {
+                    return true;
+                }
+                path.push(child);
+                if search(nodes, &nodes[child].children, target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        let mut path = Vec::new();
+        search(&self.nodes, &self.roots, index, &mut path);
+        path
     }
 }
 
@@ -437,13 +531,7 @@ fn flatten(
         let index = nodes.len();
         indices.push(index);
         if !pending_is_dir(&node) {
-            match node.status {
-                FolderStatus::Identical => stats.identical += 1,
-                FolderStatus::Different => stats.different += 1,
-                FolderStatus::LeftOnly => stats.left_only += 1,
-                FolderStatus::RightOnly => stats.right_only += 1,
-                FolderStatus::Error => stats.errors += 1,
-            }
+            stats.add(node.status);
         }
         nodes.push(FolderNode {
             name: node.name.to_string_lossy().into_owned(),
@@ -535,5 +623,26 @@ mod tests {
         progress.cancel();
         let result = compare_folders(dir.path(), dir.path(), &progress);
         assert_eq!(result.map(|_| ()).map_err(|e| e.kind()), Err(io::ErrorKind::Interrupted));
+    }
+
+    #[test]
+    fn refreshing_a_saved_file_updates_it_and_its_folders() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (left, right) = (dir.path().join("l"), dir.path().join("r"));
+        write(&left.join("sub/a.txt"), "one");
+        write(&right.join("sub/a.txt"), "two");
+        write(&left.join("b.txt"), "same");
+        write(&right.join("b.txt"), "same");
+        let mut comparison =
+            compare_folders(&left, &right, &FolderProgress::default()).expect("compare");
+        assert_eq!(status_of(&comparison, "sub"), FolderStatus::Different);
+        assert_eq!(comparison.stats.different, 1);
+
+        write(&right.join("sub/a.txt"), "one");
+        assert!(comparison.refresh_file(&right.join("sub/a.txt")));
+        assert_eq!(status_of(&comparison, "sub/a.txt"), FolderStatus::Identical);
+        assert_eq!(status_of(&comparison, "sub"), FolderStatus::Identical);
+        assert_eq!((comparison.stats.identical, comparison.stats.different), (2, 0));
+        assert!(!comparison.refresh_file(&dir.path().join("elsewhere.txt")));
     }
 }

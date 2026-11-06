@@ -10,7 +10,7 @@ use gpui::{
 
 use compare_core::{BYTES_PER_ROW, BinaryDiff, FileInfo};
 
-use crate::file_header;
+use crate::file_header::{self, Counterpart};
 use crate::format;
 use crate::path_actions;
 use crate::theme;
@@ -187,9 +187,17 @@ impl Render for HexDiffView {
                 div()
                     .flex()
                     .flex_row()
-                    .child(file_header::file_header(&self.left))
+                    .child(file_header::file_header(
+                        "hex-left",
+                        &self.left,
+                        Some(Counterpart { info: &self.right, name: "right file" }),
+                    ))
                     .child(div().w(px(1.0)).bg(theme::surface()))
-                    .child(file_header::file_header(&self.right)),
+                    .child(file_header::file_header(
+                        "hex-right",
+                        &self.right,
+                        Some(Counterpart { info: &self.left, name: "left file" }),
+                    )),
             )
             .child(banner)
             .child(

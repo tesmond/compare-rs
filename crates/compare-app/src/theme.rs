@@ -5,11 +5,37 @@ use gpui::{Hsla, Pixels, px, rgb, rgba};
 pub const MONO_FONT: &str = "Menlo";
 
 pub fn row_height() -> Pixels {
-    px(18.0)
+    px(20.0)
 }
 
+/// Code and file contents.
 pub fn code_text_size() -> Pixels {
+    px(13.0)
+}
+
+/// Labels on buttons, tabs, headers, and the find bar.
+pub fn ui_text_size() -> Pixels {
     px(12.0)
+}
+
+/// The status bar summary.
+pub fn summary_text_size() -> Pixels {
+    px(11.0)
+}
+
+/// Secondary details: sizes, dates, folders, and hints.
+pub fn meta_text_size() -> Pixels {
+    px(10.0)
+}
+
+/// Height of toolbar and header buttons.
+pub fn control_height() -> Pixels {
+    px(28.0)
+}
+
+/// Height of the file headers above a comparison.
+pub fn header_height() -> Pixels {
+    px(32.0)
 }
 
 fn color(hex: u32) -> Hsla {
@@ -49,7 +75,7 @@ pub fn muted() -> Hsla {
 }
 
 pub fn gutter() -> Hsla {
-    color(0x585b70)
+    color(0x6c7086)
 }
 
 pub fn accent() -> Hsla {
@@ -60,6 +86,11 @@ pub fn accent_translucent() -> Hsla {
     rgba(0x89b4fa44).into()
 }
 
+/// Background of a toggle that is switched on.
+pub fn active_bg() -> Hsla {
+    rgba(0x89b4fa33).into()
+}
+
 /// Background of selected text on the side with the cursor.
 pub fn selection() -> Hsla {
     rgba(0x89b4fa55).into()
@@ -67,7 +98,17 @@ pub fn selection() -> Hsla {
 
 /// Background of selected text on the other side.
 pub fn selection_inactive() -> Hsla {
-    rgba(0x9399b233).into()
+    rgba(0x9399b255).into()
+}
+
+/// Background of text matching the find pattern.
+pub fn find_match() -> Hsla {
+    rgba(0xf9e2af66).into()
+}
+
+/// Background of the selected find match.
+pub fn find_current() -> Hsla {
+    rgba(0xfab387aa).into()
 }
 
 pub fn cursor() -> Hsla {

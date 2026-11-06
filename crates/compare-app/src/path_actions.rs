@@ -1,10 +1,11 @@
 //! Context-menu operations on file paths.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui::{
     App, ClipboardItem, Div, FocusHandle, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Styled, div,
+    ParentElement, Styled, Window, div,
 };
 use gpui_component::menu::{ContextMenuExt, PopupMenu};
 
@@ -30,6 +31,9 @@ pub fn add_path_items(menu: PopupMenu, has_left: bool, has_right: bool) -> Popup
         .menu_with_disabled("Reveal Right in Finder", Box::new(RevealRight), !has_right)
 }
 
+/// Adds items to a context menu when it opens.
+pub type MenuItems = Rc<dyn Fn(PopupMenu, &mut Window, &mut App) -> PopupMenu>;
+
 /// Wraps `content` so a right-click shows the path menu for a fixed pair of
 /// files, and the menu's actions copy or reveal those files.
 pub fn with_file_pair_menu(
@@ -37,6 +41,28 @@ pub fn with_file_pair_menu(
     focus: &FocusHandle,
     left: Option<PathBuf>,
     right: Option<PathBuf>,
+) -> impl IntoElement {
+    with_menu(content, focus, left, right, None)
+}
+
+/// Like [`with_file_pair_menu`], with `edit_items` at the top of the menu,
+/// separated from the path items below them.
+pub fn with_edit_and_file_menu(
+    content: Div,
+    focus: &FocusHandle,
+    left: Option<PathBuf>,
+    right: Option<PathBuf>,
+    edit_items: MenuItems,
+) -> impl IntoElement {
+    with_menu(content, focus, left, right, Some(edit_items))
+}
+
+fn with_menu(
+    content: Div,
+    focus: &FocusHandle,
+    left: Option<PathBuf>,
+    right: Option<PathBuf>,
+    edit_items: Option<MenuItems>,
 ) -> impl IntoElement {
     let (has_left, has_right) = (left.is_some(), right.is_some());
     let menu_focus = focus.clone();
@@ -61,7 +87,12 @@ pub fn with_file_pair_menu(
         .on_action(move |_: &RevealLeft, _, cx| reveal_left(cx))
         .on_action(move |_: &RevealRight, _, cx| reveal_right(cx))
         .child(content)
-        .context_menu(move |menu, _, _| {
-            add_path_items(menu.action_context(menu_focus.clone()), has_left, has_right)
+        .context_menu(move |menu, window, cx| {
+            let menu = menu.action_context(menu_focus.clone());
+            let menu = match &edit_items {
+                Some(items) => items(menu, window, cx).separator(),
+                None => menu,
+            };
+            add_path_items(menu, has_left, has_right)
         })
 }

@@ -1,11 +1,13 @@
 //! Drawing the comparison: aligned rows of editable lines.
 
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, CursorStyle, Div, ElementInputHandler, Hsla, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
-    ScrollWheelEvent, Styled, Window, canvas, div, list, px,
+    AnyElement, ClickEvent, Context, CursorStyle, Div, ElementInputHandler, Hsla,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Render, ScrollWheelEvent, StatefulInteractiveElement, Styled, WeakEntity,
+    Window, canvas, div, list, px,
 };
 
 use compare_core::{DiffSide, RowKind};
@@ -13,26 +15,114 @@ use compare_diff::InlineDiff;
 
 use super::TextDiffView;
 use super::editing::Motion;
+use gpui_component::IconName;
+
 use crate::actions::{
-    Backspace, CollapseSelection, Copy, Cut, DIFF_EDITOR_CONTEXT, DeleteForward, DeleteToLineStart,
-    DeleteWordLeft, DeleteWordRight, Indent, MoveDocEnd, MoveDocStart, MoveDown, MoveLeft,
-    MoveLineEnd, MoveLineStart, MovePageDown, MovePageUp, MoveRight, MoveUp, MoveWordLeft,
-    MoveWordRight, Newline, Paste, Redo, SelectAll, SelectDocEnd, SelectDocStart, SelectDown,
-    SelectLeft, SelectLineEnd, SelectLineStart, SelectPageDown, SelectPageUp, SelectRight,
-    SelectUp, SelectWordLeft, SelectWordRight, ShowCharacterPalette, Undo,
+    Backspace, CloseFind, CollapseSelection, Copy, CopyBlockToLeft, CopyBlockToRight,
+    CopyLineToLeft, CopyLineToRight, Cut, DIFF_EDITOR_CONTEXT, DeleteForward, DeleteToLineStart,
+    DeleteWordLeft, DeleteWordRight, FindNext, FindPrev, Indent, InsertLine, MoveDocEnd,
+    MoveDocStart, MoveDown, MoveLeft, MoveLineEnd, MoveLineStart, MovePageDown, MovePageUp,
+    MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Newline, OpenFind, OpenFolderLeft,
+    OpenFolderRight, OpenLeft, OpenReplace, OpenRight, Paste, Redo, ReplaceAll, ReplaceNext,
+    SelectAll, SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd,
+    SelectLineStart, SelectPageDown, SelectPageUp, SelectRight, SelectUp, SelectWordLeft,
+    SelectWordRight, ShowCharacterPalette, Undo,
 };
+use crate::button::{self, ButtonState, Segment};
 use crate::code_text::{self, Mark};
 use crate::editor_line::EditorLine;
-use crate::file_header;
+use crate::file_header::{self, Counterpart};
 use crate::format;
-use crate::path_actions;
+use crate::path_actions::{self, MenuItems};
 use crate::theme;
 
 use super::motion;
 use compare_core::EditKind;
 
 /// Width of the line-number gutter.
-pub(super) const GUTTER_WIDTH: f32 = 52.0;
+pub(super) const GUTTER_WIDTH: f32 = 48.0;
+
+/// Width of the change marker on each outer edge of a row.
+pub(super) const MARKER_WIDTH: f32 = 3.0;
+
+/// Width of the dividers on either side of the center column.
+pub(super) const DIVIDER_WIDTH: f32 = 1.0;
+
+/// Width of the column between the sides that holds the copy arrows.
+pub(super) const CENTER_WIDTH: f32 = 48.0;
+
+/// Padding between the line numbers and the text.
+pub(super) const TEXT_PADDING: f32 = 8.0;
+
+/// Width of a block-copy arrow (« or ») in the center column.
+const BLOCK_ARROW_WIDTH: f32 = 13.0;
+
+/// Width of a line-copy arrow (‹ or ›) in the center column.
+const LINE_ARROW_WIDTH: f32 = 11.0;
+
+/// Group name for showing a row's line-copy arrows on hover.
+const ROW_GROUP: &str = "diff-row";
+
+/// A copy arrow in the center column.
+struct CopyArrow {
+    id: &'static str,
+    glyph: &'static str,
+    /// True for a single line, false for a whole block.
+    line: bool,
+    /// The side copied from.
+    from: DiffSide,
+    hint: &'static str,
+    action: Box<dyn gpui::Action>,
+}
+
+impl CopyArrow {
+    fn block(from: DiffSide) -> Self {
+        match from {
+            DiffSide::Left => Self {
+                id: "copy-block-right",
+                glyph: "»",
+                line: false,
+                from,
+                hint: "Copy section to right",
+                action: Box::new(CopyBlockToRight),
+            },
+            DiffSide::Right => Self {
+                id: "copy-block-left",
+                glyph: "«",
+                line: false,
+                from,
+                hint: "Copy section to left",
+                action: Box::new(CopyBlockToLeft),
+            },
+        }
+    }
+
+    fn line(from: DiffSide) -> Self {
+        match from {
+            DiffSide::Left => Self {
+                id: "copy-line-right",
+                glyph: "›",
+                line: true,
+                from,
+                hint: "Copy line to right",
+                action: Box::new(CopyLineToRight),
+            },
+            DiffSide::Right => Self {
+                id: "copy-line-left",
+                glyph: "‹",
+                line: true,
+                from,
+                hint: "Copy line to left",
+                action: Box::new(CopyLineToLeft),
+            },
+        }
+    }
+}
+
+/// A 1px divider between a side and the center column.
+fn divider() -> Div {
+    div().flex_none().w(px(DIVIDER_WIDTH)).bg(theme::surface())
+}
 
 /// How one side of a row is drawn.
 struct CellStyle<'a> {
@@ -107,11 +197,84 @@ impl TextDiffView {
             ))
         };
         row_div
-            .child(div().flex_none().w(px(3.0)).bg(marker))
+            .group(ROW_GROUP)
+            .child(div().flex_none().w(px(MARKER_WIDTH)).bg(marker))
             .child(left)
-            .child(div().flex_none().w(px(1.0)).bg(theme::surface()))
+            .child(divider())
+            .child(self.render_center(index, row.kind, cx))
+            .child(divider())
             .child(right)
+            .child(div().flex_none().w(px(MARKER_WIDTH)).bg(marker))
             .into_any_element()
+    }
+
+    /// The column between the sides: « and » copy a whole changed block (on
+    /// its first row); ‹ and › copy one line (faint until the row is
+    /// hovered).
+    fn render_center(&self, index: usize, kind: RowKind, cx: &mut Context<Self>) -> Div {
+        let column = div()
+            .flex_none()
+            .w(px(CENTER_WIDTH))
+            .flex()
+            .flex_row()
+            .bg(theme::mantle())
+            // Clicks here are for the arrows, not for placing the cursor.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        if kind == RowKind::Equal {
+            return column;
+        }
+        let starts_change = self.starts_change(index);
+        let writable = |side: DiffSide| self.side(side).read_only.is_none();
+        let arrow = |copy: CopyArrow, cx: &mut Context<Self>| {
+            let width = if copy.line { LINE_ARROW_WIDTH } else { BLOCK_ARROW_WIDTH };
+            let slot = div().flex_none().w(px(width)).flex().items_center().justify_center();
+            let shown = copy.line || starts_change;
+            if !shown || !writable(copy.from.other()) {
+                return slot;
+            }
+            let (from, line) = (copy.from, copy.line);
+            let button = div()
+                .id((copy.id, index))
+                .h_full()
+                .min_h(px(16.0))
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(theme::ui_text_size())
+                .cursor_pointer()
+                .child(copy.glyph)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    window.focus(&this.focus);
+                    if line {
+                        this.copy_line(index, from, cx);
+                    } else {
+                        this.copy_block(index, from, cx);
+                    }
+                }));
+            let button = if line {
+                button
+                    .text_color(theme::subtext())
+                    .opacity(0.35)
+                    .group_hover(ROW_GROUP, |style| style.opacity(1.0))
+                    .hover(|style| style.text_color(theme::text()))
+            } else {
+                button
+                    .h(px(16.0))
+                    .rounded(px(3.0))
+                    .bg(theme::surface())
+                    .text_color(theme::text())
+                    .hover(|style| style.bg(theme::surface_bright()))
+            };
+            let hint = button::Hint::action(copy.hint, copy.action.as_ref());
+            slot.child(button::with_hint(button, hint))
+        };
+        column
+            .child(arrow(CopyArrow::block(DiffSide::Right), cx))
+            .child(arrow(CopyArrow::line(DiffSide::Right), cx))
+            .child(arrow(CopyArrow::line(DiffSide::Left), cx))
+            .child(arrow(CopyArrow::block(DiffSide::Left), cx))
     }
 
     /// One side of a row: line-number gutter plus the line's text, with the
@@ -151,7 +314,14 @@ impl TextDiffView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
                     this.mouse_down(side, row, event, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.mouse_down_right(side, row, event, window, cx);
                 }),
             )
             .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
@@ -161,14 +331,14 @@ impl TextDiffView {
                 div()
                     .flex_none()
                     .w(px(GUTTER_WIDTH))
-                    .pr_2()
+                    .pr(px(TEXT_PADDING))
                     .flex()
                     .justify_end()
                     .text_color(theme::gutter())
                     .bg(theme::mantle())
                     .child(number),
             )
-            .child(div().flex_1().min_w_0().pl_2().overflow_hidden().child(text))
+            .child(div().flex_1().min_w_0().pl(px(TEXT_PADDING)).overflow_hidden().child(text))
     }
 
     /// The text of `line` on `side` with syntax colors, changed words,
@@ -189,6 +359,26 @@ impl TextDiffView {
             .iter()
             .map(|range| Mark::background(range.clone(), style.emphasis_color))
             .collect();
+
+        if let Some(find) = &self.find {
+            let current = find.current_match();
+            for found in find.matches_on_line(side, line) {
+                let start = if found.start.line == line { found.start.column } else { 0 };
+                let end = if found.end.line == line { found.end.column } else { text.len() };
+                let range =
+                    format::to_display_offset(text, start)..format::to_display_offset(text, end);
+                let is_current = current.is_some_and(|(s, m)| s == side && m == found);
+                marks.push(Mark {
+                    range,
+                    background: Some(if is_current {
+                        theme::find_current()
+                    } else {
+                        theme::find_match()
+                    }),
+                    underline: Some(theme::yellow()),
+                });
+            }
+        }
 
         let is_active = side == self.active;
         let selection = state.selection.range();
@@ -228,24 +418,126 @@ impl TextDiffView {
         }))
     }
 
-    fn render_headers(&self) -> Div {
-        let header = |side: DiffSide| {
+    /// The file headers, each with an unsaved-changes marker and Save and
+    /// Revert buttons.
+    /// The file headers, laid out on the same grid as the rows: name and
+    /// folder, details, and buttons to choose another file, save, or revert.
+    fn render_headers(&self, cx: &mut Context<Self>) -> Div {
+        let header = |side: DiffSide, cx: &mut Context<Self>| {
             let state = self.side(side);
-            file_header::file_header_with_note(
-                &state.info,
-                state.read_only.as_ref().map(|note| note.as_ref()),
-            )
+            let modified = state.is_modified();
+            let name = state.display_name();
+            let name = if modified { format!("● {name}") } else { name };
+            let folder = match &state.path {
+                Some(path) => file_header::folder_label(path),
+                None => "Not saved yet".to_owned(),
+            };
+            // Size and date compare with the other side when both are files.
+            let other = self.side(side.other());
+            let counterpart = other.path.is_some().then_some(Counterpart {
+                info: &other.info,
+                name: match side {
+                    DiffSide::Left => "right file",
+                    DiffSide::Right => "left file",
+                },
+            });
+            let id = match side {
+                DiffSide::Left => "header-left",
+                DiffSide::Right => "header-right",
+            };
+            let details = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .children(state.read_only.clone())
+                .children((state.read_only.is_some() && state.path.is_some()).then_some("·"))
+                .children(
+                    state
+                        .path
+                        .is_some()
+                        .then(|| file_header::file_details(id, &state.info, counterpart)),
+                );
+            let pickers = self.file_backed.then(|| {
+                let (file, folder): (Box<dyn gpui::Action>, Box<dyn gpui::Action>) = match side {
+                    DiffSide::Left => (Box::new(OpenLeft), Box::new(OpenFolderLeft)),
+                    DiffSide::Right => (Box::new(OpenRight), Box::new(OpenFolderRight)),
+                };
+                button::segmented(vec![
+                    Segment::action(
+                        IconName::File,
+                        file,
+                        ButtonState::Enabled,
+                        "Choose another file",
+                    ),
+                    Segment::action(
+                        IconName::FolderOpen,
+                        folder,
+                        ButtonState::Enabled,
+                        "Choose a folder",
+                    ),
+                ])
+            });
+            let save = button::with_hint(
+                button::button(
+                    ("save-side", side.index()),
+                    "Save",
+                    ButtonState::enabled(modified && state.read_only.is_none()),
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.focus);
+                        this.save(side, window, cx).detach();
+                    }),
+                ),
+                button::Hint::text("Save this side"),
+            );
+            let revert = button::with_hint(
+                button::button(
+                    ("revert-side", side.index()),
+                    "Revert",
+                    ButtonState::enabled(modified && state.path.is_some()),
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.focus);
+                        this.revert(side, cx);
+                    }),
+                ),
+                button::Hint::text("Discard unsaved changes to this side"),
+            );
+            file_header::titled_header(name, folder, details)
+                .children(pickers)
+                .child(save)
+                .child(revert)
+        };
+        let spacer = |width: f32| {
+            div()
+                .flex_none()
+                .w(px(width))
+                .bg(theme::mantle())
+                .border_b_1()
+                .border_color(theme::surface())
         };
         div()
             .flex()
             .flex_row()
-            .child(header(DiffSide::Left))
-            .child(div().w(px(1.0)).bg(theme::surface()))
-            .child(header(DiffSide::Right))
+            .child(spacer(MARKER_WIDTH))
+            .child(header(DiffSide::Left, cx))
+            .child(divider())
+            .child(spacer(CENTER_WIDTH))
+            .child(divider())
+            .child(header(DiffSide::Right, cx))
+            .child(spacer(MARKER_WIDTH))
     }
 
     fn render_banner(&self) -> Option<Div> {
-        if self.identical {
+        let blank = |side: DiffSide| {
+            let buffer = &self.side(side).buffer;
+            buffer.len() == 1 && buffer.line(0).is_empty()
+        };
+        if blank(DiffSide::Left) && blank(DiffSide::Right) {
+            Some(file_header::banner(
+                "Type or paste text on each side to compare it · ⌘⇧B beautifies JSON, dicts, and \\n",
+                theme::subtext(),
+            ))
+        } else if self.identical {
             Some(file_header::banner("Files are identical", theme::green()))
         } else if !self.diff.has_changes() {
             Some(file_header::banner(
@@ -332,9 +624,32 @@ fn bind_editing_actions(element: Div, cx: &mut Context<TextDiffView>) -> Div {
     let element = on!(element, Undo, |this, cx| this.undo(cx));
     let element = on!(element, Redo, |this, cx| this.redo(cx));
     let element = on!(element, CollapseSelection, |this, cx| this.collapse_selection(cx));
+    let element = on!(element, CopyBlockToRight, |this, cx| {
+        this.copy_target_section(DiffSide::Right, cx)
+    });
+    let element =
+        on!(element, CopyBlockToLeft, |this, cx| { this.copy_target_section(DiffSide::Left, cx) });
+    let element =
+        on!(element, CopyLineToRight, |this, cx| this.copy_target_line(DiffSide::Right, cx));
+    let element =
+        on!(element, CopyLineToLeft, |this, cx| this.copy_target_line(DiffSide::Left, cx));
+    let element = on!(element, InsertLine, |this, cx| this.insert_line(cx));
     element.on_action(cx.listener(|_, _: &ShowCharacterPalette, window, _| {
         window.show_character_palette();
     }))
+}
+
+/// The editing commands at the top of the context menu, enabled for the
+/// row that was right-clicked when the menu opens.
+fn edit_menu_items(view: WeakEntity<TextDiffView>) -> MenuItems {
+    Rc::new(move |menu, _, cx| {
+        let state = view.upgrade().map(|view| view.read(cx).edit_menu_state()).unwrap_or_default();
+        menu.menu_with_disabled("Insert Line", Box::new(InsertLine), !state.insert_line)
+            .menu_with_disabled("Copy Line Left", Box::new(CopyLineToLeft), !state.copy_left)
+            .menu_with_disabled("Copy Line Right", Box::new(CopyLineToRight), !state.copy_right)
+            .menu_with_disabled("Copy Section Left", Box::new(CopyBlockToLeft), !state.copy_left)
+            .menu_with_disabled("Copy Section Right", Box::new(CopyBlockToRight), !state.copy_right)
+    })
 }
 
 /// Target of ⌘⌫: the start of the line, or the previous line's end when
@@ -372,24 +687,34 @@ impl Render for TextDiffView {
         .flex_1()
         .bg(theme::base());
 
-        let content = div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .child(self.render_headers())
-            .children(self.render_banner())
-            .child(rows)
-            .child(input_handler);
-        let file_backed = self.file_backed;
-        let menu = path_actions::with_file_pair_menu(
+        let content = div().flex().flex_col().size_full().child(rows).child(input_handler);
+        let menu = path_actions::with_edit_and_file_menu(
             content,
             &self.focus,
-            file_backed.then(|| self.sides[0].info.path.clone()),
-            file_backed.then(|| self.sides[1].info.path.clone()),
+            self.sides[0].path.clone(),
+            self.sides[1].path.clone(),
+            edit_menu_items(cx.entity().downgrade()),
         );
+        // Editing keys apply only while the text has focus, not the find bar.
+        let editor = div()
+            .flex_1()
+            .min_h_0()
+            .key_context(DIFF_EDITOR_CONTEXT)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.mouse_down_below_text(event, window, cx);
+                }),
+            )
+            .child(menu);
         let root = div()
             .size_full()
-            .key_context(DIFF_EDITOR_CONTEXT)
+            .flex()
+            .flex_col()
+            .child(self.render_headers(cx))
+            .children(self.render_find_bar(cx))
+            .children(self.render_banner())
+            .child(editor)
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, _| this.mouse_up()),
@@ -398,7 +723,17 @@ impl Render for TextDiffView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, _| this.mouse_up()),
             )
-            .child(menu);
+            .on_action(cx.listener(|this, _: &OpenFind, window, cx| {
+                this.open_find(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenReplace, window, cx| {
+                this.open_find(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FindNext, _, cx| this.find_step(true, cx)))
+            .on_action(cx.listener(|this, _: &FindPrev, _, cx| this.find_step(false, cx)))
+            .on_action(cx.listener(|this, _: &ReplaceNext, _, cx| this.replace_next(cx)))
+            .on_action(cx.listener(|this, _: &ReplaceAll, _, cx| this.replace_all(cx)))
+            .on_action(cx.listener(|this, _: &CloseFind, window, cx| this.close_find(window, cx)));
         bind_editing_actions(root, cx)
     }
 }

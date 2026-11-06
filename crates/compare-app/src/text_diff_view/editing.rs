@@ -11,7 +11,7 @@ use gpui::{
 use compare_core::{DiffSide, Edit, EditBuffer, EditKind, Position};
 
 use super::motion;
-use super::render::GUTTER_WIDTH;
+use super::render::{CENTER_WIDTH, DIVIDER_WIDTH, GUTTER_WIDTH, MARKER_WIDTH, TEXT_PADDING};
 use super::side::{Selection, SideState};
 use super::{REDIFF_DELAY, TextDiffView, display_width};
 use crate::format;
@@ -96,6 +96,7 @@ impl TextDiffView {
         if self.side(side).read_only.is_some() {
             return false;
         }
+        self.context_row = None;
         let before = self.side(side).selection;
         let edit = self.apply_edit(side, range, text, cx);
         let after = Selection::caret(edit.new_range().end);
@@ -104,6 +105,7 @@ impl TextDiffView {
         state.marked = None;
         state.history.record(edit, kind, before, after, Instant::now());
         self.reveal_cursor();
+        self.update_matches(false, cx);
         cx.notify();
         true
     }
@@ -112,6 +114,30 @@ impl TextDiffView {
     pub(super) fn replace_selection(&mut self, text: &str, kind: EditKind, cx: &mut Context<Self>) {
         let range = self.active_side().selection.range();
         self.edit(self.active, range, text, kind, cx);
+    }
+
+    /// Reformats JSON, Python dicts, and `\n` escapes on every editable side,
+    /// each as one undoable edit. Sides that are already tidy are left
+    /// alone.
+    pub fn beautify(&mut self, cx: &mut Context<Self>) {
+        for side in [DiffSide::Left, DiffSide::Right] {
+            if self.side(side).read_only.is_some() {
+                continue;
+            }
+            let text = self.side(side).buffer.joined();
+            let std::borrow::Cow::Owned(pretty) = compare_beautify::beautify(&text) else {
+                continue;
+            };
+            if pretty == text {
+                continue;
+            }
+            let all = Position::default()..self.side(side).buffer.end();
+            self.edit(side, all, &pretty, EditKind::Other, cx);
+            // Leave the cursor at the top rather than the end of the text.
+            self.side_mut(side).selection = Selection::caret(Position::default());
+        }
+        self.list.scroll_to_reveal_item(0);
+        cx.notify();
     }
 
     pub(super) fn undo(&mut self, cx: &mut Context<Self>) {
@@ -127,6 +153,7 @@ impl TextDiffView {
         }
         self.side_mut(side).selection = step.selection_before;
         self.reveal_cursor();
+        self.update_matches(false, cx);
         cx.notify();
     }
 
@@ -143,6 +170,7 @@ impl TextDiffView {
         }
         self.side_mut(side).selection = step.selection_after;
         self.reveal_cursor();
+        self.update_matches(false, cx);
         cx.notify();
     }
 
@@ -177,6 +205,7 @@ impl TextDiffView {
             }
             other => (self.target(other, selection.head), None),
         };
+        self.context_row = None;
         let state = self.side_mut(self.active);
         let anchor = if select { selection.anchor } else { head };
         state.selection = Selection { anchor, head, goal_column };
@@ -271,7 +300,8 @@ impl TextDiffView {
     /// Width of one side's text area (excluding the line-number gutter).
     fn text_area_width(&self) -> Pixels {
         let width = self.list.viewport_bounds().size.width;
-        ((width - px(4.0)) / 2.0 - px(GUTTER_WIDTH) - px(8.0)).max(px(0.0))
+        let chrome = 2.0 * (MARKER_WIDTH + DIVIDER_WIDTH) + CENTER_WIDTH;
+        ((width - px(chrome)) / 2.0 - px(GUTTER_WIDTH + TEXT_PADDING)).max(px(0.0))
     }
 
     pub(super) fn select_all(&mut self, cx: &mut Context<Self>) {
@@ -388,6 +418,7 @@ impl TextDiffView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus);
+        self.context_row = None;
         let position = self.position_at(side, row, event.position);
         let extend = event.modifiers.shift && side == self.active;
         self.active = side;
@@ -412,6 +443,49 @@ impl TextDiffView {
             _ if extend => Selection { head: position, goal_column: None, ..state.selection },
             _ => Selection::caret(position),
         };
+        cx.notify();
+    }
+
+    /// Prepares for the context menu: moves the cursor to the clicked line
+    /// (unless the click is inside the selection) and remembers the row, so
+    /// menu commands act on it.
+    pub(super) fn mouse_down_right(
+        &mut self,
+        side: DiffSide,
+        row: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus);
+        let position = self.position_at(side, row, event.position);
+        let selection = self.side(side).selection;
+        let inside_selection =
+            side == self.active && !selection.is_empty() && selection.range().contains(&position);
+        self.active = side;
+        if !inside_selection {
+            self.set_cursor(position);
+        }
+        self.context_row = Some((side, row));
+        cx.notify();
+    }
+
+    /// Puts the cursor at the end of the side clicked when the click lands
+    /// below the last line.
+    pub(super) fn mouse_down_below_text(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = self.list.viewport_bounds();
+        let side =
+            if event.position.x < bounds.center().x { DiffSide::Left } else { DiffSide::Right };
+        window.focus(&self.focus);
+        self.active = side;
+        let end = self.side(side).buffer.end();
+        self.set_cursor(end);
+        self.reveal_cursor();
         cx.notify();
     }
 

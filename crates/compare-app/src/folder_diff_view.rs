@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     App, ClickEvent, Context, Div, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement,
@@ -11,6 +11,7 @@ use gpui::{
     uniform_list,
 };
 use gpui_component::menu::ContextMenuExt;
+use gpui_component::{Icon, IconName, Sizable};
 
 use compare_core::{EntryMeta, FolderComparison, FolderNode, FolderStatus};
 
@@ -107,6 +108,14 @@ impl FolderDiffView {
         };
         view.rebuild_visible();
         view
+    }
+
+    /// Re-checks the file pair that includes `path` after it was saved.
+    pub fn refresh_file(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.comparison.refresh_file(path) {
+            self.rebuild_visible();
+            cx.notify();
+        }
     }
 
     /// One-line description for the status bar.
@@ -434,7 +443,7 @@ impl FolderDiffView {
             .items_center()
             .px_2()
             .bg(theme::crust())
-            .text_size(px(10.0))
+            .text_size(theme::meta_text_size())
             .text_color(theme::muted())
             .child(div().flex_1().child(header("Name", SortColumn::Name, cx)))
             .child(div().flex_none().w(px(SIZE_COLUMN_WIDTH)).flex().justify_end().child(header(
@@ -463,7 +472,7 @@ fn entry_cell(node: &FolderNode, meta: Option<EntryMeta>, expanded: bool) -> Div
         (true, true) => "▾",
         (true, false) => "▸",
     };
-    let icon = if is_dir { "📁" } else { "📄" };
+    let icon = if is_dir { IconName::Folder } else { IconName::File };
     let size = if is_dir { String::new() } else { format::format_size(meta.size) };
     cell.child(
         div()
@@ -475,7 +484,7 @@ fn entry_cell(node: &FolderNode, meta: Option<EntryMeta>, expanded: bool) -> Div
             .gap_1()
             .pl(px(f32::from(node.depth) * INDENT_WIDTH))
             .child(div().flex_none().w(px(10.0)).text_color(theme::muted()).child(disclosure))
-            .child(div().flex_none().text_size(px(11.0)).child(icon))
+            .child(Icon::new(icon).with_size(px(14.0)).text_color(theme::subtext()))
             .child(
                 div()
                     .min_w_0()
@@ -490,7 +499,7 @@ fn entry_cell(node: &FolderNode, meta: Option<EntryMeta>, expanded: bool) -> Div
             .w(px(SIZE_COLUMN_WIDTH))
             .flex()
             .justify_end()
-            .text_size(px(11.0))
+            .text_size(theme::ui_text_size())
             .text_color(theme::subtext())
             .child(size),
     )
@@ -499,7 +508,7 @@ fn entry_cell(node: &FolderNode, meta: Option<EntryMeta>, expanded: bool) -> Div
             .flex_none()
             .w(px(TIME_COLUMN_WIDTH))
             .pl_3()
-            .text_size(px(11.0))
+            .text_size(theme::ui_text_size())
             .text_color(theme::muted())
             .whitespace_nowrap()
             .child(format::format_time(meta.modified)),
@@ -580,9 +589,11 @@ impl Render for FolderDiffView {
                         filter_state,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_differences_only(cx)),
                     ))
-                    .child(div().text_size(px(10.0)).text_color(theme::muted()).child(
-                        "Double-click or press Enter to compare files · ←/→ collapse/expand",
-                    )),
+                    .child(
+                        div().text_size(theme::meta_text_size()).text_color(theme::muted()).child(
+                            "Double-click or press Enter to compare files · ←/→ collapse/expand",
+                        ),
+                    ),
             )
             .child(
                 div()

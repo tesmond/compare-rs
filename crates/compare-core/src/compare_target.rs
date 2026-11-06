@@ -53,6 +53,11 @@ impl CompareTarget {
         Ok(Self { original: path.to_owned(), extracted })
     }
 
+    /// Returns true if this is an archive unpacked into a temporary folder.
+    pub fn is_extracted(&self) -> bool {
+        self.extracted.is_some()
+    }
+
     /// The path the user selected.
     pub fn original(&self) -> &Path {
         &self.original

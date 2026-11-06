@@ -16,7 +16,6 @@ mod format;
 mod hex_diff_view;
 mod horizontal_scroll;
 mod merge_view;
-mod paste_compare_view;
 mod path_actions;
 mod session_state;
 mod tab;
@@ -27,16 +26,19 @@ mod workspace;
 use std::path::PathBuf;
 
 use gpui::{
-    App, AppContext, Application, Bounds, Focusable, Menu, MenuItem, PromptLevel, SharedString,
-    TitlebarOptions, WindowBounds, WindowOptions, px, size,
+    App, AppContext, Application, Bounds, Focusable, Global, Menu, MenuItem, PromptLevel,
+    SharedString, TitlebarOptions, WeakEntity, WindowBounds, WindowOptions, px, size,
 };
 
 use crate::actions::{
-    CloseTab, Compare, CopyPaths, Merge, NewTab, NewTextCompare, NextDifference, NextTab,
+    Beautify, CloseTab, Compare, CopyPaths, Merge, NewTab, NewTextCompare, NextDifference, NextTab,
     OpenFolderLeft, OpenFolderRight, OpenLeft, OpenRight, PrevDifference, PrevTab, Quit,
-    ToggleBeautify, ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
+    RevertFile, SaveAll, SaveFile, ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
 };
-use crate::actions::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+use crate::actions::{
+    Copy, CopyBlockToLeft, CopyBlockToRight, CopyLineToLeft, CopyLineToRight, Cut, FindNext,
+    FindPrev, InsertLine, OpenFind, OpenReplace, Paste, Redo, SelectAll, Undo,
+};
 use crate::workspace::Workspace;
 
 const APP_NAME: &str = "compare-rs";
@@ -44,9 +46,9 @@ const APP_NAME: &str = "compare-rs";
 fn main() {
     crash_log::install();
     let cli_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(gpui_component_assets::Assets).run(|cx: &mut App| {
         actions::bind_keys(cx);
-        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        cx.on_action(quit);
         cx.set_menus(menus());
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -57,6 +59,7 @@ fn main() {
 
         gpui_component::init(cx);
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        actions::bind_find_keys(cx);
 
         let session = session_state::load().unwrap_or_default();
         let window_bounds =
@@ -85,6 +88,14 @@ fn main() {
                 workspace
             });
             window.focus(&workspace.read(cx).focus_handle(cx));
+            cx.set_global(MainWorkspace(workspace.downgrade()));
+            // Closing the window quits, so ask about unsaved edits first.
+            let closing_workspace = workspace.downgrade();
+            window.on_window_should_close(cx, move |window, cx| {
+                closing_workspace
+                    .update(cx, |workspace, cx| workspace.confirm_window_close(window, cx))
+                    .unwrap_or(true)
+            });
             // Save the final state synchronously on quit, since a pending
             // debounced save would be dropped.
             let saved_workspace = workspace.clone();
@@ -121,6 +132,32 @@ fn main() {
     });
 }
 
+/// The workspace of the main window, so app-level actions can reach it.
+struct MainWorkspace(WeakEntity<Workspace>);
+
+impl Global for MainWorkspace {}
+
+/// Quits, letting the workspace ask about unsaved edits first.
+fn quit(_: &Quit, cx: &mut App) {
+    let Some(workspace) = cx.try_global::<MainWorkspace>().and_then(|main| main.0.upgrade()) else {
+        cx.quit();
+        return;
+    };
+    // Run once the current event is done, when the window is free to update.
+    cx.defer(move |cx| {
+        let Some(window) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
+            cx.quit();
+            return;
+        };
+        let asked = window.update(cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.request_quit(window, cx));
+        });
+        if asked.is_err() {
+            cx.quit();
+        }
+    });
+}
+
 fn menus() -> Vec<Menu> {
     vec![
         Menu { name: APP_NAME.into(), items: vec![MenuItem::action("Quit", Quit)] },
@@ -137,6 +174,10 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Three-way Merge…", Merge),
                 MenuItem::separator(),
+                MenuItem::action("Save", SaveFile),
+                MenuItem::action("Save Both Sides", SaveAll),
+                MenuItem::action("Revert", RevertFile),
+                MenuItem::separator(),
                 MenuItem::action("Close Tab", CloseTab),
             ],
         },
@@ -151,6 +192,17 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Paste", Paste),
                 MenuItem::separator(),
                 MenuItem::action("Select All", SelectAll),
+                MenuItem::separator(),
+                MenuItem::action("Find…", OpenFind),
+                MenuItem::action("Find and Replace…", OpenReplace),
+                MenuItem::action("Find Next", FindNext),
+                MenuItem::action("Find Previous", FindPrev),
+                MenuItem::separator(),
+                MenuItem::action("Insert Line", InsertLine),
+                MenuItem::action("Copy Line Left", CopyLineToLeft),
+                MenuItem::action("Copy Line Right", CopyLineToRight),
+                MenuItem::action("Copy Section Left", CopyBlockToLeft),
+                MenuItem::action("Copy Section Right", CopyBlockToRight),
             ],
         },
         Menu {
@@ -162,7 +214,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Ignore Whitespace", ToggleIgnoreWhitespace),
                 MenuItem::action("Ignore Case", ToggleIgnoreCase),
-                MenuItem::action("Beautify JSON / Dicts / \\n", ToggleBeautify),
+                MenuItem::action("Beautify JSON / Dicts / \\n", Beautify),
                 MenuItem::action("Word Wrap", ToggleWordWrap),
                 MenuItem::separator(),
                 MenuItem::action("Copy Paths", CopyPaths),

@@ -1,23 +1,25 @@
 //! Three-way merge view: left / base / right panes plus a merged output pane.
 
-use std::ops::Range;
 use std::path::PathBuf;
 
 use gpui::{
-    AppContext, ClickEvent, Context, Div, Entity, FocusHandle, Hsla, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, ScrollStrategy, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, div, px, uniform_list,
+    AnyElement, AppContext, ClickEvent, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
+    InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Pixels,
+    Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div, list,
+    px,
 };
+use gpui_component::IconName;
 use gpui_component::input::{Input, InputState};
 
 use compare_core::{FileInfo, MergeDocument, OutputLine, Resolution, TextDocument};
 use compare_diff::MergeRegionKind;
 
-use crate::button::{self, ButtonState};
+use crate::actions::{NextDifference, PrevDifference};
+use crate::button::{self, ButtonState, Hint, Segment};
 use crate::code_text;
 use crate::crash_log;
 use crate::document_syntax::DocumentSyntax;
-use crate::file_header;
+use crate::file_header::{self, Counterpart};
 use crate::format;
 use crate::horizontal_scroll::HorizontalScroll;
 use crate::path_actions;
@@ -38,9 +40,11 @@ pub struct MergeView {
     horizontal: HorizontalScroll,
     /// Index into `document.conflicts` of the selected conflict.
     selected_conflict: Option<usize>,
-    input_scroll: UniformListScrollHandle,
-    output_scroll: UniformListScrollHandle,
+    input_list: ListState,
+    output_list: ListState,
     message: Option<(SharedString, Hsla)>,
+    /// Whether long lines wrap.
+    wrap: bool,
 }
 
 impl MergeView {
@@ -53,6 +57,7 @@ impl MergeView {
     ) -> Self {
         let [left, base, right] = infos;
         let output = document.output_lines();
+        let (document_rows, output_rows) = (document.rows.len(), output.len());
         let selected_conflict = (!document.conflicts.is_empty()).then_some(0);
         let max_columns = [&document.left, &document.base, &document.right]
             .into_iter()
@@ -70,10 +75,35 @@ impl MergeView {
             editor: None,
             horizontal: HorizontalScroll::new(max_columns),
             selected_conflict,
-            input_scroll: UniformListScrollHandle::new(),
-            output_scroll: UniformListScrollHandle::new(),
+            input_list: ListState::new(document_rows, ListAlignment::Top, px(300.0)),
+            output_list: ListState::new(output_rows, ListAlignment::Top, px(300.0)),
             message: None,
+            wrap: false,
         }
+    }
+
+    /// Sets whether long lines wrap.
+    pub fn with_wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
+        self
+    }
+
+    /// Turns line wrapping on or off in all panes, including the editor.
+    pub fn set_wrap(&mut self, wrap: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wrap == wrap {
+            return;
+        }
+        self.wrap = wrap;
+        self.horizontal.reset();
+        for list in [&self.input_list, &self.output_list] {
+            let top = list.logical_scroll_top();
+            list.reset(list.item_count());
+            list.scroll_to(top);
+        }
+        if let Some(editor) = &self.editor {
+            editor.update(cx, |state, cx| state.set_soft_wrap(wrap, window, cx));
+        }
+        cx.notify();
     }
 
     /// One-line description for the status bar.
@@ -110,10 +140,11 @@ impl MergeView {
     fn select_conflict(&mut self, conflict: usize, cx: &mut Context<Self>) {
         self.selected_conflict = Some(conflict);
         let region = self.document.conflicts[conflict];
-        self.input_scroll
-            .scroll_to_item(self.document.region_first_row[region], ScrollStrategy::Center);
+        let near =
+            |row: usize| ListOffset { item_ix: row.saturating_sub(5), offset_in_item: px(0.0) };
+        self.input_list.scroll_to(near(self.document.region_first_row[region]));
         if let Some(line) = self.output_row_of_region(region) {
-            self.output_scroll.scroll_to_item(line, ScrollStrategy::Center);
+            self.output_list.scroll_to(near(line));
         }
         cx.notify();
     }
@@ -147,6 +178,9 @@ impl MergeView {
         let region = self.document.conflicts[conflict];
         self.document.resolutions[region] = resolution;
         self.output = self.document.output_lines();
+        let top = self.output_list.logical_scroll_top();
+        self.output_list.reset(self.output.len());
+        self.output_list.scroll_to(top);
         self.message = None;
         // Move on to the next unresolved conflict, if there is one.
         let next_unresolved = (0..self.document.conflicts.len())
@@ -235,7 +269,10 @@ impl MergeView {
     fn start_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.document.merged_text().replace("\r\n", "\n");
         let editor = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).code_editor("text").line_number(true);
+            let mut state = InputState::new(window, cx)
+                .code_editor("text")
+                .line_number(true)
+                .soft_wrap(self.wrap);
             state.set_value(text, window, cx);
             state
         });
@@ -266,104 +303,89 @@ impl MergeView {
         self.selected_conflict.map(|c| self.document.conflicts[c])
     }
 
-    fn render_input_rows(
-        &self,
-        range: Range<usize>,
-        cx: &mut Context<Self>,
-    ) -> Vec<impl IntoElement + use<>> {
+    fn render_input_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let selected_region = self.selected_region();
-        range
-            .map(|index| {
-                let row = self.document.rows[index];
-                let region = &self.document.regions[row.region as usize];
-                let selected = selected_region == Some(row.region as usize);
-                let resolution = self.document.resolutions[row.region as usize];
-                let (left_bg, base_bg, right_bg) = region_backgrounds(region.kind, selected);
-                let marker = match (region.kind, resolution) {
-                    (MergeRegionKind::Conflict, Resolution::Unresolved) => theme::yellow(),
-                    (MergeRegionKind::Conflict, _) => theme::green(),
-                    _ => theme::base(),
-                };
-                div()
-                    .id(("merge-row", index))
-                    .flex()
-                    .flex_row()
-                    .w_full()
-                    .h(theme::row_height())
-                    .font_family(theme::MONO_FONT)
-                    .text_size(theme::code_text_size())
-                    .on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.on_row_click(index, cx)
-                        }),
-                    )
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        this.on_scroll(event, cx)
-                    }))
-                    .child(div().flex_none().w(px(3.0)).h_full().bg(marker))
-                    .child(self.merge_cell(row.left, 0, left_bg))
-                    .child(div().flex_none().w(px(1.0)).h_full().bg(theme::surface()))
-                    .child(self.merge_cell(row.base, 1, base_bg))
-                    .child(div().flex_none().w(px(1.0)).h_full().bg(theme::surface()))
-                    .child(self.merge_cell(row.right, 2, right_bg))
-            })
-            .collect()
+        {
+            let row = self.document.rows[index];
+            let region = &self.document.regions[row.region as usize];
+            let selected = selected_region == Some(row.region as usize);
+            let resolution = self.document.resolutions[row.region as usize];
+            let (left_bg, base_bg, right_bg) = region_backgrounds(region.kind, selected);
+            let marker = match (region.kind, resolution) {
+                (MergeRegionKind::Conflict, Resolution::Unresolved) => theme::yellow(),
+                (MergeRegionKind::Conflict, _) => theme::green(),
+                _ => theme::base(),
+            };
+            self.row_height(div().id(("merge-row", index)).flex().flex_row().w_full())
+                .font_family(theme::MONO_FONT)
+                .line_height(theme::row_height())
+                .text_size(theme::code_text_size())
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.on_row_click(index, cx)),
+                )
+                .on_scroll_wheel(
+                    cx.listener(|this, event: &ScrollWheelEvent, _, cx| this.on_scroll(event, cx)),
+                )
+                .child(div().flex_none().w(px(3.0)).bg(marker))
+                .child(self.merge_cell(row.left, 0, left_bg))
+                .child(div().flex_none().w(px(1.0)).bg(theme::surface()))
+                .child(self.merge_cell(row.base, 1, base_bg))
+                .child(div().flex_none().w(px(1.0)).bg(theme::surface()))
+                .child(self.merge_cell(row.right, 2, right_bg))
+                .into_any_element()
+        }
     }
 
-    fn render_output_rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<Div> {
-        range
-            .map(|index| {
-                let line = self.output[index];
-                let text = format::display_line(self.document.output_text(line));
-                let (background, color, tokens) = match line {
-                    OutputLine::Base(i) => {
-                        (theme::base(), theme::text(), self.syntax[1].tokens(i as usize, &text))
-                    }
-                    OutputLine::Left(i) => (
-                        theme::deleted_bg(),
-                        theme::text(),
-                        self.syntax[0].tokens(i as usize, &text),
-                    ),
-                    OutputLine::Right(i) => (
-                        theme::inserted_bg(),
-                        theme::text(),
-                        self.syntax[2].tokens(i as usize, &text),
-                    ),
-                    OutputLine::ConflictStart
-                    | OutputLine::ConflictSeparator
-                    | OutputLine::ConflictEnd => {
-                        (theme::conflict_bg(), theme::yellow(), Vec::new())
-                    }
-                };
-                div()
-                    .flex()
-                    .flex_row()
-                    .w_full()
-                    .h(theme::row_height())
-                    .font_family(theme::MONO_FONT)
-                    .text_size(theme::code_text_size())
-                    .bg(background)
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        this.on_scroll(event, cx)
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(52.0))
-                            .pr_2()
-                            .flex()
-                            .justify_end()
-                            .bg(theme::mantle())
-                            .text_color(theme::gutter())
-                            .child((index + 1).to_string()),
-                    )
-                    .child(text_column(
-                        code_text::code_text(text, &tokens, &[]),
-                        color,
-                        self.horizontal.offset(),
-                    ))
-            })
-            .collect()
+    /// Fixes a row to one line, or lets it grow when lines wrap.
+    fn row_height<E: Styled>(&self, row: E) -> E {
+        if self.wrap { row.min_h(theme::row_height()) } else { row.h(theme::row_height()) }
+    }
+
+    fn render_output_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        {
+            let line = self.output[index];
+            let text = format::display_line(self.document.output_text(line));
+            let (background, color, tokens) = match line {
+                OutputLine::Base(i) => {
+                    (theme::base(), theme::text(), self.syntax[1].tokens(i as usize, &text))
+                }
+                OutputLine::Left(i) => {
+                    (theme::deleted_bg(), theme::text(), self.syntax[0].tokens(i as usize, &text))
+                }
+                OutputLine::Right(i) => {
+                    (theme::inserted_bg(), theme::text(), self.syntax[2].tokens(i as usize, &text))
+                }
+                OutputLine::ConflictStart
+                | OutputLine::ConflictSeparator
+                | OutputLine::ConflictEnd => (theme::conflict_bg(), theme::yellow(), Vec::new()),
+            };
+            self.row_height(div().flex().flex_row().w_full())
+                .font_family(theme::MONO_FONT)
+                .text_size(theme::code_text_size())
+                .line_height(theme::row_height())
+                .bg(background)
+                .on_scroll_wheel(
+                    cx.listener(|this, event: &ScrollWheelEvent, _, cx| this.on_scroll(event, cx)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(52.0))
+                        .pr_2()
+                        .flex()
+                        .justify_end()
+                        .bg(theme::mantle())
+                        .text_color(theme::gutter())
+                        .child((index + 1).to_string()),
+                )
+                .child(text_column(
+                    code_text::code_text(text, &tokens, &[]),
+                    color,
+                    self.horizontal.offset(),
+                    self.wrap,
+                ))
+                .into_any_element()
+        }
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
@@ -378,14 +400,16 @@ impl MergeView {
         } else {
             ButtonState::Enabled
         };
-        let resolve_button = |id: &'static str,
-                              label: &'static str,
-                              resolution: Resolution,
-                              cx: &mut Context<Self>| {
-            button::button(
+        let resolve = |id: &'static str,
+                       label: &'static str,
+                       hint: &'static str,
+                       resolution: Resolution,
+                       cx: &mut Context<Self>| {
+            Segment::new(
                 id,
                 label,
                 has_selection,
+                Hint::text(hint),
                 cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.resolve(resolution, cx);
                 }),
@@ -408,43 +432,56 @@ impl MergeView {
         div()
             .flex()
             .flex_row()
+            .flex_none()
             .items_center()
-            .gap_1()
-            .px_2()
-            .py(px(3.0))
+            .gap(px(16.0))
+            .px_3()
+            .h(px(36.0))
             .bg(theme::mantle())
             .border_b_1()
             .border_color(theme::surface())
-            .child(button::button(
-                "prev-conflict",
-                "◀ Prev Conflict",
-                has_conflicts,
-                cx.listener(|this, _: &ClickEvent, _, cx| this.prev_difference(cx)),
-            ))
-            .child(button::button(
-                "next-conflict",
-                "Next Conflict ▶",
-                has_conflicts,
-                cx.listener(|this, _: &ClickEvent, _, cx| this.next_difference(cx)),
-            ))
-            .child(button::separator())
-            .child(resolve_button("take-left", "Take Left", Resolution::Left, cx))
-            .child(resolve_button("take-right", "Take Right", Resolution::Right, cx))
-            .child(resolve_button(
-                "take-left-right",
-                "Left then Right",
-                Resolution::LeftThenRight,
-                cx,
-            ))
-            .child(resolve_button(
-                "take-right-left",
-                "Right then Left",
-                Resolution::RightThenLeft,
-                cx,
-            ))
-            .child(resolve_button("take-base", "Take Base", Resolution::Base, cx))
-            .child(resolve_button("unresolve", "Unresolve", Resolution::Unresolved, cx))
-            .child(button::separator())
+            .child(button::segmented(vec![
+                Segment::new(
+                    "prev-conflict",
+                    IconName::ArrowUp,
+                    has_conflicts,
+                    Hint::action("Previous conflict", &PrevDifference),
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.prev_difference(cx)),
+                ),
+                Segment::new(
+                    "next-conflict",
+                    IconName::ArrowDown,
+                    has_conflicts,
+                    Hint::action("Next conflict", &NextDifference),
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.next_difference(cx)),
+                ),
+            ]))
+            .child(button::segmented(vec![
+                resolve("take-left", "Left", "Use the left version", Resolution::Left, cx),
+                resolve("take-right", "Right", "Use the right version", Resolution::Right, cx),
+                resolve(
+                    "take-left-right",
+                    "Left + Right",
+                    "Use the left version, then the right",
+                    Resolution::LeftThenRight,
+                    cx,
+                ),
+                resolve(
+                    "take-right-left",
+                    "Right + Left",
+                    "Use the right version, then the left",
+                    Resolution::RightThenLeft,
+                    cx,
+                ),
+                resolve("take-base", "Base", "Keep the base version", Resolution::Base, cx),
+                resolve(
+                    "unresolve",
+                    "Unresolve",
+                    "Mark the conflict as unresolved",
+                    Resolution::Unresolved,
+                    cx,
+                ),
+            ]))
             .child(if editing {
                 button::button(
                     "discard-edits",
@@ -455,19 +492,26 @@ impl MergeView {
             } else {
                 button::button(
                     "edit-output",
-                    "✎ Edit Output",
+                    "Edit Output",
                     ButtonState::Enabled,
                     cx.listener(|this, _: &ClickEvent, window, cx| this.start_editing(window, cx)),
                 )
             })
-            .child(button::button(
-                "save-merged",
-                "💾 Save Merged…",
-                ButtonState::Enabled,
-                cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx)),
-            ))
+            .child(
+                button::button(
+                    "save-merged",
+                    "Save Merged…",
+                    ButtonState::Enabled,
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx)),
+                )
+                .px_3()
+                .font_weight(FontWeight::SEMIBOLD)
+                .bg(theme::accent())
+                .text_color(theme::crust())
+                .hover(|style| style.bg(theme::text()).text_color(theme::crust())),
+            )
             .child(div().flex_1())
-            .child(div().text_size(px(11.0)).text_color(status.1).child(status.0))
+            .child(div().text_size(theme::ui_text_size()).text_color(status.1).child(status.0))
     }
 }
 
@@ -486,14 +530,13 @@ fn region_backgrounds(kind: MergeRegionKind, selected: bool) -> (Hsla, Hsla, Hsl
     }
 }
 
-/// The text column of a row, shifted by the horizontal scroll offset.
-fn text_column(text: gpui::StyledText, color: Hsla, offset: Pixels) -> Div {
-    div()
-        .flex_1()
-        .min_w_0()
-        .pl_2()
-        .overflow_hidden()
-        .child(div().ml(-offset).whitespace_nowrap().text_color(color).child(text))
+/// The text column of a row: wrapped, or shifted by the horizontal scroll
+/// offset.
+fn text_column(text: gpui::StyledText, color: Hsla, offset: Pixels, wrap: bool) -> Div {
+    let inner = div().text_color(color).child(text);
+    let inner =
+        if wrap { inner.whitespace_normal() } else { inner.ml(-offset).whitespace_nowrap() };
+    div().flex_1().min_w_0().pl_2().overflow_hidden().child(inner)
 }
 
 impl MergeView {
@@ -518,7 +561,6 @@ impl MergeView {
             .flex_row()
             .flex_1()
             .min_w_0()
-            .h_full()
             .overflow_hidden()
             .bg(background)
             .child(
@@ -536,6 +578,7 @@ impl MergeView {
                 code_text::code_text(text, &tokens, &[]),
                 theme::text(),
                 self.horizontal.offset(),
+                self.wrap,
             ))
     }
 }
@@ -551,27 +594,34 @@ impl Render for MergeView {
                 div()
                     .flex()
                     .flex_row()
-                    .child(file_header::file_header(&self.left))
+                    .child(file_header::file_header(
+                        "merge-left",
+                        &self.left,
+                        Some(Counterpart { info: &self.base, name: "base" }),
+                    ))
                     .child(div().w(px(1.0)).bg(theme::surface()))
-                    .child(file_header::header_bar(
-                        format!("Base: {}", format::path_label(&self.base.path)),
+                    .child(file_header::titled_header(
+                        format!("Base: {}", format::file_name(&self.base.path)),
+                        file_header::folder_label(&self.base.path),
                         format::format_size(self.base.size),
                     ))
                     .child(div().w(px(1.0)).bg(theme::surface()))
-                    .child(file_header::file_header(&self.right)),
+                    .child(file_header::file_header(
+                        "merge-right",
+                        &self.right,
+                        Some(Counterpart { info: &self.base, name: "base" }),
+                    )),
             )
             .child(
                 div().flex_grow().flex_basis(px(0.0)).min_h_0().child(
                     path_actions::with_file_pair_menu(
                         div().flex().flex_col().size_full().child(
-                            uniform_list(
-                                "merge-input-rows",
-                                self.document.rows.len(),
-                                cx.processor(|this, range: Range<usize>, _window, cx| {
-                                    this.render_input_rows(range, cx)
+                            list(
+                                self.input_list.clone(),
+                                cx.processor(|this, index: usize, _window, cx| {
+                                    this.render_input_row(index, cx)
                                 }),
                             )
-                            .track_scroll(self.input_scroll.clone())
                             .flex_1()
                             .bg(theme::base()),
                         ),
@@ -594,14 +644,12 @@ impl Render for MergeView {
                     .text_size(theme::code_text_size())
                     .child(Input::new(editor).h_full().appearance(false))
                     .into_any_element(),
-                None => uniform_list(
-                    "merge-output-rows",
-                    self.output.len(),
-                    cx.processor(|this, range: Range<usize>, _window, cx| {
-                        this.render_output_rows(range, cx)
+                None => list(
+                    self.output_list.clone(),
+                    cx.processor(|this, index: usize, _window, cx| {
+                        this.render_output_row(index, cx)
                     }),
                 )
-                .track_scroll(self.output_scroll.clone())
                 .flex_grow()
                 .flex_basis(px(0.0))
                 .bg(theme::base())

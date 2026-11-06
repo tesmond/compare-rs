@@ -15,13 +15,16 @@ actions!(
         CompareFolders,
         Merge,
         CloseTab,
+        SaveFile,
+        SaveAll,
+        RevertFile,
         NextTab,
         PrevTab,
         NextDifference,
         PrevDifference,
         ToggleIgnoreWhitespace,
         ToggleIgnoreCase,
-        ToggleBeautify,
+        Beautify,
         ToggleWordWrap,
         CopyPaths,
         Quit,
@@ -76,6 +79,18 @@ actions!(
         Redo,
         CollapseSelection,
         ShowCharacterPalette,
+        CopyBlockToRight,
+        CopyBlockToLeft,
+        CopyLineToRight,
+        CopyLineToLeft,
+        InsertLine,
+        OpenFind,
+        OpenReplace,
+        FindNext,
+        FindPrev,
+        ReplaceNext,
+        ReplaceAll,
+        CloseFind,
     ]
 );
 
@@ -90,7 +105,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-t", NewTab, None),
         KeyBinding::new("cmd-n", NewTextCompare, None),
-        KeyBinding::new("cmd-shift-b", ToggleBeautify, None),
+        KeyBinding::new("cmd-shift-b", Beautify, None),
         KeyBinding::new("alt-z", ToggleWordWrap, None),
         KeyBinding::new("cmd-o", OpenLeft, None),
         KeyBinding::new("cmd-shift-o", OpenRight, None),
@@ -100,6 +115,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-l", CompareFolders, None),
         KeyBinding::new("cmd-shift-m", Merge, None),
         KeyBinding::new("cmd-w", CloseTab, None),
+        KeyBinding::new("cmd-s", SaveFile, None),
+        KeyBinding::new("alt-cmd-s", SaveAll, None),
         KeyBinding::new("cmd-]", NextTab, None),
         KeyBinding::new("cmd-[", PrevTab, None),
         KeyBinding::new("alt-down", NextDifference, None),
@@ -115,6 +132,28 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", OpenSelected, Some(FOLDER_VIEW_CONTEXT)),
     ]);
     bind_editor_keys(cx);
+}
+
+/// Registers find-bar keys. Call after the UI component library has
+/// registered its own, so these win inside the find and replace fields.
+pub fn bind_find_keys(cx: &mut App) {
+    use crate::text_diff_view::{FIND_QUERY_CONTEXT, REPLACE_QUERY_CONTEXT};
+    let find_field = format!("{FIND_QUERY_CONTEXT} > Input");
+    let replace_field = format!("{REPLACE_QUERY_CONTEXT} > Input");
+    let line_break = gpui_component::input::Enter { secondary: false };
+    cx.bind_keys([
+        KeyBinding::new("cmd-f", OpenFind, None),
+        KeyBinding::new("alt-cmd-f", OpenReplace, None),
+        KeyBinding::new("cmd-g", FindNext, None),
+        KeyBinding::new("cmd-shift-g", FindPrev, None),
+        KeyBinding::new("enter", FindNext, Some(&find_field)),
+        KeyBinding::new("shift-enter", line_break.clone(), Some(&find_field)),
+        KeyBinding::new("escape", CloseFind, Some(&find_field)),
+        KeyBinding::new("enter", ReplaceNext, Some(&replace_field)),
+        KeyBinding::new("alt-cmd-enter", ReplaceAll, Some(&replace_field)),
+        KeyBinding::new("shift-enter", line_break, Some(&replace_field)),
+        KeyBinding::new("escape", CloseFind, Some(&replace_field)),
+    ]);
 }
 
 fn bind_editor_keys(cx: &mut App) {
@@ -165,5 +204,9 @@ fn bind_editor_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-z", Redo, context),
         KeyBinding::new("escape", CollapseSelection, context),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, context),
+        KeyBinding::new("ctrl-alt-right", CopyBlockToRight, context),
+        KeyBinding::new("ctrl-alt-left", CopyBlockToLeft, context),
+        KeyBinding::new("ctrl-alt-shift-right", CopyLineToRight, context),
+        KeyBinding::new("ctrl-alt-shift-left", CopyLineToLeft, context),
     ]);
 }

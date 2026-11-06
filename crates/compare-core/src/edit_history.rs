@@ -120,7 +120,21 @@ impl<S: Clone> History<S> {
 
     /// Marks the current state as saved.
     pub fn mark_saved(&mut self) {
-        self.saved_id = Some(self.current_id());
+        let version = self.begin_save();
+        self.mark_saved_version(version);
+    }
+
+    /// Identifies the current state, so it can be marked as saved once a
+    /// save finishes, even if more edits are made meanwhile. Later edits
+    /// start a new undo step so they are not counted as saved.
+    pub fn begin_save(&mut self) -> u64 {
+        self.break_next = true;
+        self.current_id()
+    }
+
+    /// Marks the state that had `version` as the saved one.
+    pub fn mark_saved_version(&mut self, version: u64) {
+        self.saved_id = Some(version);
         self.break_next = true;
     }
 
@@ -239,6 +253,19 @@ mod tests {
         assert!(!history.is_modified());
         history.redo();
         assert!(history.is_modified());
+    }
+
+    #[test]
+    fn typing_during_a_save_stays_modified() {
+        let mut history: History<()> = History::default();
+        let now = Instant::now();
+        history.record(typed(0, "a"), EditKind::Typing, (), (), now);
+        let version = history.begin_save();
+        history.record(typed(1, "b"), EditKind::Typing, (), (), now);
+        history.mark_saved_version(version);
+        assert!(history.is_modified());
+        history.undo();
+        assert!(!history.is_modified());
     }
 
     #[test]

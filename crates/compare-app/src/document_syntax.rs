@@ -29,6 +29,16 @@ impl DocumentSyntax {
         Self { language: Some(language), highlighter: Some(highlighter), line_states }
     }
 
+    /// Like [`DocumentSyntax::new`], for text held as lines.
+    pub fn from_lines(path: &Path, lines: &[String]) -> Self {
+        let Some(language) = Language::from_path(path) else {
+            return Self::default();
+        };
+        let highlighter = Highlighter::new(language);
+        let line_states = highlighter.line_states(lines.iter().map(String::as_str));
+        Self { language: Some(language), highlighter: Some(highlighter), line_states }
+    }
+
     /// Tokens for line `index`, whose display text is `text`.
     pub fn tokens(&self, index: usize, text: &str) -> Vec<Token> {
         match (&self.highlighter, self.line_states.get(index)) {

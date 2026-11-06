@@ -5,32 +5,34 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, ClickEvent, ClipboardItem, Context, Div, ExternalPaths, FocusHandle,
-    Focusable, Hsla, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, px,
+    App, AppContext, ClickEvent, ClipboardItem, Context, Div, Entity, ExternalPaths, FocusHandle,
+    Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, PathPromptOptions,
+    PromptLevel, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
+    Window, div, px,
 };
+use gpui_component::{Icon, IconName, Sizable, tooltip::Tooltip};
 
 use compare_core::{
     CompareOptions, CompareTarget, ComparisonContent, DiffOptions, FileComparison, FileInfo,
-    FolderComparison, FolderProgress, MergeDocument, TargetKind, TextDocument,
+    FolderComparison, FolderProgress, MergeDocument, TargetKind, TextDiff, TextDocument,
 };
 
 use crate::actions::{
-    CloseTab, Compare, CompareFolders, CopyPaths, Merge, NewTab, NewTextCompare, NextDifference,
-    NextTab, OpenFolderLeft, OpenFolderRight, OpenLeft, OpenRight, PrevDifference, PrevTab,
-    ToggleBeautify, ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
+    Beautify, CloseTab, Compare, CompareFolders, CopyPaths, FindNext, FindPrev, Merge, NewTab,
+    NewTextCompare, NextDifference, NextTab, OpenFind, OpenFolderLeft, OpenFolderRight, OpenLeft,
+    OpenReplace, OpenRight, PrevDifference, PrevTab, Quit, RevertFile, SaveAll, SaveFile,
+    ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
 };
-use crate::button::{self, ButtonState};
+use crate::button::{self, ButtonState, Content, Segment};
 use crate::crash_log;
 use crate::document_syntax::DocumentSyntax;
 use crate::folder_diff_view::{FolderDiffView, OpenFilePair};
 use crate::format;
 use crate::hex_diff_view::HexDiffView;
 use crate::merge_view::MergeView;
-use crate::paste_compare_view::PasteCompareView;
 use crate::session_state::{self, SavedBounds, SavedTab, SessionState};
 use crate::tab::{Side, Tab, TabContent, TabKind};
-use crate::text_diff_view::TextDiffView;
+use crate::text_diff_view::{TextDiffEvent, TextDiffView};
 use crate::theme;
 
 /// How long the session waits after the last change before it is saved.
@@ -120,7 +122,6 @@ impl Workspace {
     pub fn restore(&mut self, session: SessionState, cx: &mut Context<Self>) {
         self.options.diff.ignore_whitespace = session.ignore_whitespace;
         self.options.diff.ignore_case = session.ignore_case;
-        self.options.beautify = session.beautify;
         self.wrap = session.word_wrap;
         for saved in session.tabs {
             let kind = if saved.merge { TabKind::Merge } else { TabKind::Compare };
@@ -157,7 +158,6 @@ impl Workspace {
             active_tab: self.active,
             ignore_whitespace: self.options.diff.ignore_whitespace,
             ignore_case: self.options.diff.ignore_case,
-            beautify: self.options.beautify,
             word_wrap: self.wrap,
         }
     }
@@ -195,6 +195,159 @@ impl Workspace {
         self.tabs.iter().position(|tab| tab.id == id)
     }
 
+    /// The editable comparison shown in the tab at `index`, if any.
+    fn text_view(&self, index: usize) -> Option<&Entity<TextDiffView>> {
+        match &self.tabs.get(index)?.content {
+            TabContent::Text(view) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// Returns true if the tab at `index` has unsaved edits.
+    fn tab_is_modified(&self, index: usize, cx: &App) -> bool {
+        self.text_view(index).is_some_and(|view| view.read(cx).is_modified())
+    }
+
+    /// Closes the tab at `index`, first asking whether to save any unsaved
+    /// edits.
+    fn request_close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.text_view(index).filter(|view| view.read(cx).is_modified()).cloned()
+        else {
+            self.close_tab(index, cx);
+            return;
+        };
+        let names = view.read(cx).modified_names().join(" and ");
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Save changes to {names}?"),
+            Some("Your changes will be lost if you don't save them."),
+            &["Save", "Don't Save", "Cancel"],
+            cx,
+        );
+        let tab_id = self.tabs[index].id;
+        cx.spawn_in(window, async move |this, cx| {
+            match answer.await {
+                Ok(0) => {
+                    let Ok(save) = view.update_in(cx, |view, window, cx| view.save_all(window, cx))
+                    else {
+                        return;
+                    };
+                    if !save.await {
+                        return;
+                    }
+                }
+                Ok(1) => {}
+                _ => return,
+            }
+            this.update(cx, |this, cx| {
+                if let Some(index) = this.tab_index(tab_id) {
+                    this.close_tab(index, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Quits, first asking whether to save unsaved edits in any tab.
+    pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let views: Vec<Entity<TextDiffView>> = (0..self.tabs.len())
+            .filter(|&index| self.tab_is_modified(index, cx))
+            .filter_map(|index| self.text_view(index).cloned())
+            .collect();
+        if views.is_empty() {
+            cx.quit();
+            return;
+        }
+        let names: Vec<String> =
+            views.iter().flat_map(|view| view.read(cx).modified_names()).collect();
+        let message = match names.as_slice() {
+            [one] => format!("Save changes to {one} before quitting?"),
+            many => format!("Save changes to {} files before quitting?", many.len()),
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some("Your changes will be lost if you don't save them."),
+            &["Save All", "Don't Save", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            match answer.await {
+                Ok(0) => {
+                    for view in views {
+                        let Ok(save) =
+                            view.update_in(cx, |view, window, cx| view.save_all(window, cx))
+                        else {
+                            return;
+                        };
+                        if !save.await {
+                            return;
+                        }
+                    }
+                }
+                Ok(1) => {}
+                _ => return,
+            }
+            cx.update(|_, cx| cx.quit()).ok();
+        })
+        .detach();
+    }
+
+    /// Returns true if the window may close now; otherwise asks about
+    /// unsaved edits first (and quits once they are dealt with).
+    pub fn confirm_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let modified = (0..self.tabs.len()).any(|index| self.tab_is_modified(index, cx));
+        if modified {
+            self.request_quit(window, cx);
+        }
+        !modified
+    }
+
+    fn on_save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.save_active(window, cx)).detach();
+        }
+    }
+
+    fn on_save_all(&mut self, _: &SaveAll, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.save_all(window, cx)).detach();
+        }
+    }
+
+    /// Find shortcuts reach the active comparison even when it does not
+    /// have keyboard focus.
+    fn on_open_find(&mut self, _: &OpenFind, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.open_find(false, window, cx));
+        }
+    }
+
+    fn on_open_replace(&mut self, _: &OpenReplace, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.open_find(true, window, cx));
+        }
+    }
+
+    fn on_find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.find_step(true, cx));
+        }
+    }
+
+    fn on_find_prev(&mut self, _: &FindPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.find_step(false, cx));
+        }
+    }
+
+    fn on_revert_file(&mut self, _: &RevertFile, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.revert_active(cx));
+        }
+    }
+
     fn active_tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
     }
@@ -224,9 +377,20 @@ impl Workspace {
 
     /// Fills an input slot of a tab and starts comparing once all are filled.
     fn set_tab_path(&mut self, tab_id: u64, side: Side, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(index) = self.tab_index(tab_id) else {
+        let Some(mut index) = self.tab_index(tab_id) else {
             return;
         };
+        if self.tab_is_modified(index, cx) {
+            // Keep the unsaved edits: compare the new file in a new tab.
+            let (kind, inputs) = {
+                let tab = &self.tabs[index];
+                (tab.kind, [tab.left.clone(), tab.base.clone(), tab.right.clone()])
+            };
+            let id = self.add_tab(kind, cx);
+            index = self.tab_index(id).expect("tab was just added");
+            let tab = &mut self.tabs[index];
+            [tab.left, tab.base, tab.right] = inputs;
+        }
         self.tabs[index].set_path(side, path);
         if self.tabs[index].is_ready() {
             self.start_compare(index, cx);
@@ -371,7 +535,17 @@ impl Workspace {
                 match content {
                     ComparisonContent::Text(diff) => {
                         let (options, wrap) = (self.options.diff, self.wrap);
-                        TabContent::Text(cx.new(|cx| {
+                        let in_archive = |path: &Path| {
+                            self.tabs[index]
+                                .targets
+                                .iter()
+                                .any(|target| {
+                                    target.is_extracted() && path.starts_with(target.folder())
+                                })
+                                .then_some("Read-only: inside an archive")
+                        };
+                        let read_only = [in_archive(&left.path), in_archive(&right.path)];
+                        let view = cx.new(|cx| {
                             TextDiffView::new(
                                 left,
                                 right,
@@ -383,7 +557,11 @@ impl Workspace {
                                 cx,
                             )
                             .with_wrap(wrap)
-                        }))
+                            .with_read_only(read_only)
+                        });
+                        self.tabs[index].subscription =
+                            Some(self.subscribe_to_text_view(&view, cx));
+                        TabContent::Text(view)
                     }
                     ComparisonContent::Binary(diff) => TabContent::Binary(
                         cx.new(|cx| HexDiffView::new(left, right, identical, diff, cx)),
@@ -396,16 +574,25 @@ impl Workspace {
                 let (left_label, right_label) = (labels[0].clone(), labels[1].clone());
                 let view =
                     cx.new(|cx| FolderDiffView::new(comparison, left_label, right_label, cx));
-                let subscription = cx.subscribe(&view, |this, _, event: &OpenFilePair, cx| {
-                    this.open_file_pair(event.left.clone(), event.right.clone(), cx);
+                let subscription = cx.subscribe(&view, |this, folder, event: &OpenFilePair, cx| {
+                    let targets = this
+                        .tabs
+                        .iter()
+                        .find(|tab| matches!(&tab.content, TabContent::Folder(v) if *v == folder))
+                        .map(|tab| tab.targets.clone())
+                        .unwrap_or_default();
+                    this.open_file_pair(event.left.clone(), event.right.clone(), targets, cx);
                 });
                 let tab = &mut self.tabs[index];
-                tab.targets = targets;
+                tab.targets = targets.into_iter().map(Arc::new).collect();
                 tab.subscription = Some(subscription);
                 TabContent::Folder(view)
             }
             CompareOutcome::Merge { infos, syntax, document } => {
-                TabContent::Merge(cx.new(|cx| MergeView::new(infos, syntax, document, cx)))
+                let wrap = self.wrap;
+                TabContent::Merge(
+                    cx.new(|cx| MergeView::new(infos, syntax, document, cx).with_wrap(wrap)),
+                )
             }
             CompareOutcome::Failed(message) => {
                 crash_log::record_error("Comparison failed", &message);
@@ -417,8 +604,17 @@ impl Workspace {
     }
 
     /// Opens a file pair from a folder comparison in a new tab.
-    fn open_file_pair(&mut self, left: PathBuf, right: PathBuf, cx: &mut Context<Self>) {
+    fn open_file_pair(
+        &mut self,
+        left: PathBuf,
+        right: PathBuf,
+        targets: Vec<Arc<CompareTarget>>,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.add_tab(TabKind::Compare, cx);
+        if let Some(index) = self.tab_index(id) {
+            self.tabs[index].targets = targets;
+        }
         self.set_tab_path(id, Side::Left, left, cx);
         self.set_tab_path(id, Side::Right, right, cx);
     }
@@ -519,8 +715,9 @@ impl Workspace {
     }
 
     fn compare_active(&mut self, cx: &mut Context<Self>) {
-        if let Some(TabContent::Pasted(view)) = self.active_tab().map(|tab| &tab.content) {
-            view.update(cx, |view, cx| view.compare(cx));
+        if self.tab_is_modified(self.active, cx) {
+            // Edited text is re-diffed as it changes; re-reading the files
+            // would discard the edits.
             return;
         }
         if let Some(tab) = self.active_tab() {
@@ -554,23 +751,23 @@ impl Workspace {
 
     fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
-        self.close_tab(self.active, cx);
+        self.request_close_tab(self.active, window, cx);
     }
 
     fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus);
         if !self.tabs.is_empty() {
             self.active = (self.active + 1) % self.tabs.len();
             cx.notify();
         }
+        self.focus_active_tab(window, cx);
     }
 
     fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus);
         if !self.tabs.is_empty() {
             self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
             cx.notify();
         }
+        self.focus_active_tab(window, cx);
     }
 
     fn on_next_difference(&mut self, _: &NextDifference, _: &mut Window, cx: &mut Context<Self>) {
@@ -598,9 +795,6 @@ impl Workspace {
             TabContent::Merge(view) => view.update(cx, |view, cx| {
                 if forward { view.next_difference(cx) } else { view.prev_difference(cx) }
             }),
-            TabContent::Pasted(view) => view.update(cx, |view, cx| {
-                if forward { view.next_difference(cx) } else { view.prev_difference(cx) }
-            }),
             TabContent::Empty | TabContent::Loading { .. } | TabContent::Error(_) => {}
         }
     }
@@ -611,18 +805,70 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let options = self.options;
-        let view = cx.new(|cx| PasteCompareView::new(options, window, cx));
+        let (options, wrap) = (self.options.diff, self.wrap);
+        let untitled = || FileInfo { path: PathBuf::from("Untitled"), size: 0, modified: None };
+        let view = cx.new(|cx| {
+            let empty = TextDocument::default();
+            let diff = TextDiff::new(empty.clone(), empty, &options);
+            let syntax = DocumentSyntax::default();
+            TextDiffView::new(
+                untitled(),
+                untitled(),
+                true,
+                diff,
+                syntax.clone(),
+                syntax,
+                options,
+                cx,
+            )
+            .without_file_paths()
+            .with_wrap(wrap)
+        });
         let id = self.add_tab(TabKind::Text, cx);
         if let Some(index) = self.tab_index(id) {
-            self.tabs[index].content = TabContent::Pasted(view);
+            self.tabs[index].subscription = Some(self.subscribe_to_text_view(&view, cx));
+            self.tabs[index].content = TabContent::Text(view);
         }
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
-    fn on_toggle_beautify(&mut self, _: &ToggleBeautify, _: &mut Window, cx: &mut Context<Self>) {
-        self.options.beautify = !self.options.beautify;
-        self.recompare_text_tabs(true, cx);
+    /// Reformats JSON, Python dicts, and `\n` escapes on both sides of the
+    /// active comparison, as an edit that can be undone.
+    fn on_beautify(&mut self, _: &Beautify, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.beautify(cx));
+        }
+    }
+
+    /// Gives keyboard focus to the active tab's editor, or else the
+    /// workspace.
+    fn focus_active_tab(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.text_view(self.active) {
+            Some(view) => window.focus(&view.focus_handle(cx)),
+            None => window.focus(&self.focus),
+        }
+    }
+
+    /// Reacts to saves in a text comparison.
+    fn subscribe_to_text_view(
+        &self,
+        view: &Entity<TextDiffView>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(view, |this, _, event: &TextDiffEvent, cx| match event {
+            TextDiffEvent::Saved(path) => this.file_saved(path, cx),
+        })
+    }
+
+    /// Updates folder comparisons that include a file that was just saved.
+    fn file_saved(&mut self, path: &Path, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if let TabContent::Folder(view) = &tab.content {
+                view.update(cx, |view, cx| view.refresh_file(path, cx));
+            }
+        }
+        cx.notify();
     }
 
     fn on_toggle_ignore_whitespace(
@@ -632,7 +878,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.options.diff.ignore_whitespace = !self.options.diff.ignore_whitespace;
-        self.recompare_text_tabs(false, cx);
+        self.recompare_text_tabs(cx);
     }
 
     fn on_toggle_ignore_case(
@@ -642,7 +888,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.options.diff.ignore_case = !self.options.diff.ignore_case;
-        self.recompare_text_tabs(false, cx);
+        self.recompare_text_tabs(cx);
     }
 
     fn on_toggle_word_wrap(
@@ -656,7 +902,7 @@ impl Workspace {
         for tab in &self.tabs {
             match &tab.content {
                 TabContent::Text(view) => view.update(cx, |view, cx| view.set_wrap(wrap, cx)),
-                TabContent::Pasted(view) => {
+                TabContent::Merge(view) => {
                     view.update(cx, |view, cx| view.set_wrap(wrap, window, cx));
                 }
                 _ => {}
@@ -666,19 +912,15 @@ impl Workspace {
     }
 
     /// Re-runs every comparison whose result depends on the diff options.
-    /// Text comparisons are re-diffed in place, keeping any edits, unless
-    /// Beautify changed, which needs the files read again.
-    fn recompare_text_tabs(&mut self, beautify_changed: bool, cx: &mut Context<Self>) {
+    /// Text comparisons are re-diffed in place, keeping any edits.
+    fn recompare_text_tabs(&mut self, cx: &mut Context<Self>) {
         let options = self.options;
         for index in 0..self.tabs.len() {
             match &self.tabs[index].content {
-                TabContent::Text(view) if !beautify_changed => {
+                TabContent::Text(view) => {
                     view.update(cx, |view, cx| view.set_options(options.diff, cx));
                 }
-                TabContent::Text(_) | TabContent::Merge(_) => self.start_compare(index, cx),
-                TabContent::Pasted(view) => {
-                    view.update(cx, |view, cx| view.set_options(options, cx));
-                }
+                TabContent::Merge(_) => self.start_compare(index, cx),
                 _ => {}
             }
         }
@@ -729,31 +971,39 @@ impl Workspace {
                 .border_color(if active { theme::accent() } else { theme::crust() })
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    window.focus(&this.focus);
                     this.active = index;
+                    this.focus_active_tab(window, cx);
                     cx.notify();
                 }))
                 .child(
                     div()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(11.0))
+                        .text_size(theme::ui_text_size())
+                        .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                         .text_color(color)
-                        .child(tab.title()),
+                        .child(if self.tab_is_modified(index, cx) {
+                            format!("● {}", tab.title())
+                        } else {
+                            tab.title()
+                        }),
                 )
                 .child(
                     div()
                         .id(("close-tab", tab.id))
                         .px_1()
                         .rounded(px(3.0))
-                        .text_size(px(11.0))
+                        .text_size(theme::ui_text_size())
                         .text_color(theme::muted())
                         .hover(|style| style.bg(theme::surface_bright()).text_color(theme::text()))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Close tab").action(&CloseTab, None).build(window, cx)
+                        })
                         .child("×")
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             cx.stop_propagation();
                             window.focus(&this.focus);
-                            this.close_tab(index, cx);
+                            this.request_close_tab(index, window, cx);
                         })),
                 )
         });
@@ -775,7 +1025,10 @@ impl Workspace {
                     .text_color(theme::muted())
                     .cursor_pointer()
                     .hover(|style| style.text_color(theme::text()))
-                    .child("+")
+                    .tooltip(|window, cx| {
+                        Tooltip::new("New tab").action(&NewTab, None).build(window, cx)
+                    })
+                    .child(Icon::new(IconName::Plus).with_size(px(14.0)))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         window.focus(&this.focus);
                         this.add_tab(TabKind::Compare, cx);
@@ -783,76 +1036,116 @@ impl Workspace {
             )
     }
 
+    /// The toolbar: what to compare, what to do, and how to show it.
     fn render_toolbar(&self) -> Div {
-        let can_compare =
-            if self.active_tab().is_some_and(|tab| tab.is_ready() || tab.kind == TabKind::Text) {
-                ButtonState::Enabled
-            } else {
-                ButtonState::Disabled
-            };
-        let has_tab =
-            if self.tabs.is_empty() { ButtonState::Disabled } else { ButtonState::Enabled };
-        let toggle = |on: bool| if on { ButtonState::Active } else { ButtonState::Enabled };
+        let can_compare = ButtonState::enabled(
+            self.active_tab().is_some_and(|tab| tab.is_ready() || tab.kind == TabKind::Text),
+        );
+        let has_tab = ButtonState::enabled(!self.tabs.is_empty());
+        let has_text = ButtonState::enabled(self.text_view(self.active).is_some());
+        let group = || div().flex().flex_row().flex_none().items_center().gap(px(6.0));
+        let open = |content: Content, action: Box<dyn gpui::Action>, hint: &'static str| {
+            button::action_button(content, action, ButtonState::Enabled, hint)
+        };
+
+        let inputs = group()
+            .child(open(
+                Content::Icon(IconName::SquareTerminal),
+                Box::new(NewTextCompare),
+                "New text compare",
+            ))
+            .child(button::separator())
+            .child(open(
+                Content::IconBadge(IconName::File, "L"),
+                Box::new(OpenLeft),
+                "Open left file",
+            ))
+            .child(open(
+                Content::IconBadge(IconName::File, "R"),
+                Box::new(OpenRight),
+                "Open right file",
+            ))
+            .child(open(
+                Content::IconBadge(IconName::FolderOpen, "L"),
+                Box::new(OpenFolderLeft),
+                "Open left folder",
+            ))
+            .child(open(
+                Content::IconBadge(IconName::FolderOpen, "R"),
+                Box::new(OpenFolderRight),
+                "Open right folder",
+            ));
+        let actions = group()
+            .child(button::primary_action_button(
+                "Compare",
+                Box::new(Compare),
+                can_compare,
+                "Compare",
+            ))
+            .child(button::action_button(
+                "Merge…",
+                Box::new(Merge),
+                ButtonState::Enabled,
+                "Three-way merge",
+            ))
+            .child(button::segmented(vec![
+                Segment::action(
+                    IconName::ArrowUp,
+                    Box::new(PrevDifference),
+                    has_tab,
+                    "Previous difference",
+                ),
+                Segment::action(
+                    IconName::ArrowDown,
+                    Box::new(NextDifference),
+                    has_tab,
+                    "Next difference",
+                ),
+            ]));
+        let view_options = group()
+            .child(button::segmented(vec![
+                Segment::action(
+                    "Whitespace",
+                    Box::new(ToggleIgnoreWhitespace),
+                    ButtonState::toggle(self.options.diff.ignore_whitespace),
+                    "Ignore whitespace differences",
+                ),
+                Segment::action(
+                    "Case",
+                    Box::new(ToggleIgnoreCase),
+                    ButtonState::toggle(self.options.diff.ignore_case),
+                    "Ignore case differences",
+                ),
+                Segment::action(
+                    "Wrap",
+                    Box::new(ToggleWordWrap),
+                    ButtonState::toggle(self.wrap),
+                    "Wrap long lines",
+                ),
+            ]))
+            .child(button::action_button(
+                "{ } Beautify",
+                Box::new(Beautify),
+                has_text,
+                "Reformat JSON, dicts, and \\n escapes on both sides",
+            ));
+
         div()
             .flex()
             .flex_row()
             .flex_none()
             .items_center()
-            .gap_1()
-            .px_2()
-            .h(px(34.0))
+            .gap(px(16.0))
+            .px_3()
+            .h(px(36.0))
             .bg(theme::mantle())
             .border_b_1()
             .border_color(theme::surface())
-            .child(button::action_button(
-                "📝 New Text",
-                Box::new(NewTextCompare),
-                ButtonState::Enabled,
-            ))
-            .child(button::separator())
-            .child(button::action_button("📄 Left File", Box::new(OpenLeft), ButtonState::Enabled))
-            .child(button::action_button(
-                "📄 Right File",
-                Box::new(OpenRight),
-                ButtonState::Enabled,
-            ))
-            .child(button::separator())
-            .child(button::action_button(
-                "📁 Left Folder",
-                Box::new(OpenFolderLeft),
-                ButtonState::Enabled,
-            ))
-            .child(button::action_button(
-                "📁 Right Folder",
-                Box::new(OpenFolderRight),
-                ButtonState::Enabled,
-            ))
-            .child(button::separator())
-            .child(button::action_button("▶ Compare", Box::new(Compare), can_compare))
-            .child(button::action_button("🔀 Merge…", Box::new(Merge), ButtonState::Enabled))
-            .child(button::separator())
-            .child(button::action_button("▲ Prev Diff", Box::new(PrevDifference), has_tab))
-            .child(button::action_button("▼ Next Diff", Box::new(NextDifference), has_tab))
-            .child(button::separator())
-            .child(button::action_button(
-                "Ignore Whitespace",
-                Box::new(ToggleIgnoreWhitespace),
-                toggle(self.options.diff.ignore_whitespace),
-            ))
-            .child(button::action_button(
-                "Ignore Case",
-                Box::new(ToggleIgnoreCase),
-                toggle(self.options.diff.ignore_case),
-            ))
-            .child(button::action_button(
-                "{ } Beautify",
-                Box::new(ToggleBeautify),
-                toggle(self.options.beautify),
-            ))
-            .child(button::action_button("↩ Wrap", Box::new(ToggleWordWrap), toggle(self.wrap)))
+            .child(inputs)
             .child(div().flex_1())
-            .child(button::action_button("＋ New Tab", Box::new(NewTab), ButtonState::Enabled))
-            .child(button::action_button("✕ Close Tab", Box::new(CloseTab), has_tab))
+            .child(actions)
+            .child(div().flex_1())
+            .child(view_options)
     }
 
     fn render_path_bar(&self, tab: &Tab, cx: &mut Context<Self>) -> Div {
@@ -887,7 +1180,7 @@ impl Workspace {
                 .child(
                     div()
                         .flex_none()
-                        .text_size(px(10.0))
+                        .text_size(theme::meta_text_size())
                         .text_color(theme::muted())
                         .child(format!("{}:", capitalize(side.label()))),
                 )
@@ -896,7 +1189,7 @@ impl Workspace {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(11.0))
+                        .text_size(theme::ui_text_size())
                         .text_color(color)
                         .child(label),
                 )
@@ -915,7 +1208,7 @@ impl Workspace {
             .flex()
             .flex_row()
             .flex_none()
-            .h(px(28.0))
+            .h(px(36.0))
             .bg(theme::crust())
             .border_b_1()
             .border_color(theme::surface())
@@ -935,7 +1228,6 @@ impl Workspace {
             TabContent::Binary(view) => view.clone().into_any_element(),
             TabContent::Folder(view) => view.clone().into_any_element(),
             TabContent::Merge(view) => view.clone().into_any_element(),
-            TabContent::Pasted(view) => view.clone().into_any_element(),
             TabContent::Error(message) => {
                 centered_message(message.clone(), theme::red()).into_any_element()
             }
@@ -953,7 +1245,6 @@ impl Workspace {
             TabContent::Binary(view) => (view.read(cx).summary(), theme::subtext()),
             TabContent::Folder(view) => (view.read(cx).summary(), theme::subtext()),
             TabContent::Merge(view) => (view.read(cx).summary(), theme::subtext()),
-            TabContent::Pasted(view) => (view.read(cx).summary(cx), theme::subtext()),
             TabContent::Error(message) => (message.to_string(), theme::red()),
         }
     }
@@ -977,13 +1268,20 @@ impl Workspace {
             .bg(theme::mantle())
             .border_t_1()
             .border_color(theme::surface())
-            .text_size(px(10.0))
-            .child(div().min_w_0().truncate().text_color(color).child(summary))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(theme::summary_text_size())
+                    .text_color(if color == theme::muted() { color } else { theme::subtext() })
+                    .child(summary),
+            )
             .child(
                 div()
                     .flex()
                     .flex_none()
                     .gap_4()
+                    .text_size(theme::meta_text_size())
                     .text_color(theme::gutter())
                     .child("⌘O/⇧⌘O open · ⌘↩ compare · ⌥↑/⌥↓ diffs · ⌘[ ⌘] tabs · ⌘W close")
                     .child(tab_position),
@@ -999,21 +1297,30 @@ impl Render for Workspace {
         window.set_window_title(&title);
         self.save_session_if_changed(cx);
         // If the focused element went away (e.g. its tab closed), take focus
-        // back so keyboard shortcuts keep working.
-        if !self.focus.contains_focused(window, cx) {
+        // back so keyboard shortcuts keep working. Newly created elements
+        // (an editor or find field) may not be drawn yet, so only an empty
+        // focus counts as lost.
+        if window.focused(cx).is_none() {
             window.focus(&self.focus);
         }
 
+        // Once a comparison is shown, its headers name the files instead.
         let path_bar = self
             .active_tab()
             .filter(|tab| !tab.sides().is_empty())
+            .filter(|tab| {
+                matches!(
+                    tab.content,
+                    TabContent::Empty | TabContent::Loading { .. } | TabContent::Error(_)
+                )
+            })
             .map(|tab| self.render_path_bar(tab, cx));
         div()
             .id("workspace")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_new_text_compare))
-            .on_action(cx.listener(Self::on_toggle_beautify))
+            .on_action(cx.listener(Self::on_beautify))
             .on_action(cx.listener(Self::on_toggle_word_wrap))
             .on_action(cx.listener(Self::on_open_left))
             .on_action(cx.listener(Self::on_open_right))
@@ -1023,6 +1330,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_compare_folders))
             .on_action(cx.listener(Self::on_merge))
             .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
+            .on_action(cx.listener(Self::on_save_file))
+            .on_action(cx.listener(Self::on_save_all))
+            .on_action(cx.listener(Self::on_revert_file))
+            .on_action(cx.listener(Self::on_open_find))
+            .on_action(cx.listener(Self::on_open_replace))
+            .on_action(cx.listener(Self::on_find_next))
+            .on_action(cx.listener(Self::on_find_prev))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
             .on_action(cx.listener(Self::on_next_difference))
@@ -1135,7 +1450,7 @@ fn shortcut_hint(keys: &'static str, label: &'static str) -> Div {
         .py_1()
         .rounded(px(4.0))
         .bg(theme::surface())
-        .text_size(px(11.0))
+        .text_size(theme::ui_text_size())
         .child(div().text_color(theme::accent()).child(keys))
         .child(div().text_color(theme::subtext()).child(label))
 }

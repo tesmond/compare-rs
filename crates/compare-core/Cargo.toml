@@ -9,5 +9,6 @@ compare-beautify.workspace = true
 compare-diff.workspace = true
 memchr.workspace = true
 rayon.workspace = true
+regex.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

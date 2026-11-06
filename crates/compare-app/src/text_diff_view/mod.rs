@@ -4,10 +4,13 @@
 //! diff immediately ([`LiveDiff::apply_edit`]); a full diff then runs in the
 //! background once typing pauses, in case a better alignment exists.
 
+mod copying;
 mod editing;
+mod find;
 mod input_handler;
 mod motion;
 mod render;
+mod saving;
 mod side;
 
 use std::cell::RefCell;
@@ -17,7 +20,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Context, FocusHandle, ListAlignment, ListOffset, ListState, SharedString, Task, TextLayout, px,
+    App, Context, FocusHandle, Focusable, ListAlignment, ListOffset, ListState, SharedString, Task,
+    TextLayout, px,
 };
 
 use compare_core::{
@@ -29,6 +33,8 @@ use crate::document_syntax::DocumentSyntax;
 use crate::format;
 use crate::horizontal_scroll::HorizontalScroll;
 
+pub use find::{FIND_QUERY_CONTEXT, REPLACE_QUERY_CONTEXT};
+pub use saving::TextDiffEvent;
 use side::SideState;
 
 /// How long typing must pause before the whole comparison is re-diffed.
@@ -62,6 +68,11 @@ pub struct TextDiffView {
     rediff: Option<Task<()>>,
     /// Counts edits, so a re-diff of older text is discarded.
     revision: u64,
+    /// The find bar, when open.
+    find: Option<find::FindState>,
+    /// The side and row last right-clicked, which context-menu commands act
+    /// on (it may be a blank spacer row, which the cursor cannot be on).
+    context_row: Option<(DiffSide, usize)>,
 }
 
 impl TextDiffView {
@@ -85,7 +96,7 @@ impl TextDiffView {
             SideState::new(right, right_buffer, right_syntax),
         ];
         for (state, document) in sides.iter_mut().zip([&diff.left, &diff.right]) {
-            state.read_only = read_only_reason(document, diff.beautified);
+            state.read_only = read_only_reason(document);
         }
         let list = ListState::new(live.rows().len(), ListAlignment::Top, px(300.0));
         Self {
@@ -104,6 +115,8 @@ impl TextDiffView {
             dragging: false,
             rediff: None,
             revision: 0,
+            find: None,
+            context_row: None,
         }
     }
 
@@ -111,6 +124,21 @@ impl TextDiffView {
     /// copy-path and reveal-in-Finder menu items.
     pub fn without_file_paths(mut self) -> Self {
         self.file_backed = false;
+        for state in &mut self.sides {
+            state.path = None;
+            state.disk_modified = None;
+        }
+        self
+    }
+
+    /// Makes sides that cannot be edited read-only, with the reason shown in
+    /// their headers.
+    pub fn with_read_only(mut self, reasons: [Option<&'static str>; 2]) -> Self {
+        for (state, reason) in self.sides.iter_mut().zip(reasons) {
+            if let Some(reason) = reason {
+                state.read_only = Some(reason.into());
+            }
+        }
         self
     }
 
@@ -258,11 +286,14 @@ impl TextDiffView {
     }
 }
 
-/// Why a document cannot be edited, if it cannot.
-fn read_only_reason(document: &TextDocument, beautified: bool) -> Option<SharedString> {
-    if beautified {
-        return Some("Read-only while Beautify is on".into());
+impl Focusable for TextDiffView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
     }
+}
+
+/// Why a document cannot be edited, if it cannot.
+fn read_only_reason(document: &TextDocument) -> Option<SharedString> {
     if !document.is_lossy() {
         return None;
     }

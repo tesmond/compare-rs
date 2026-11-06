@@ -1,6 +1,8 @@
 //! The state of one side of an editable comparison.
 
 use std::ops::Range;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 use gpui::SharedString;
 
@@ -37,6 +39,11 @@ impl Selection {
 /// One file (or text) being compared and edited.
 pub struct SideState {
     pub info: FileInfo,
+    /// Where the text is saved; `None` for text that has never been saved.
+    pub path: Option<PathBuf>,
+    /// The file's modification time when it was loaded or last saved, to
+    /// notice changes made by other programs.
+    pub disk_modified: Option<SystemTime>,
     pub buffer: EditBuffer,
     pub syntax: DocumentSyntax,
     pub history: History<Selection>,
@@ -52,6 +59,8 @@ impl SideState {
     pub fn new(info: FileInfo, buffer: EditBuffer, mut syntax: DocumentSyntax) -> Self {
         syntax.cover(buffer.lines());
         Self {
+            path: Some(info.path.clone()),
+            disk_modified: info.modified,
             info,
             buffer,
             syntax,
@@ -59,6 +68,19 @@ impl SideState {
             selection: Selection::default(),
             read_only: None,
             marked: None,
+        }
+    }
+
+    /// Returns true if the text differs from the last saved state.
+    pub fn is_modified(&self) -> bool {
+        self.history.is_modified()
+    }
+
+    /// The file name, or "Untitled" for text never saved.
+    pub fn display_name(&self) -> String {
+        match &self.path {
+            Some(_) => self.info.display_name(),
+            None => "Untitled".to_owned(),
         }
     }
 }

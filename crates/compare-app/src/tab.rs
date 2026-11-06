@@ -10,7 +10,6 @@ use compare_core::{CompareTarget, FolderProgress};
 use crate::folder_diff_view::FolderDiffView;
 use crate::hex_diff_view::HexDiffView;
 use crate::merge_view::MergeView;
-use crate::paste_compare_view::PasteCompareView;
 use crate::text_diff_view::TextDiffView;
 
 /// Whether a tab compares two items or merges three files.
@@ -52,7 +51,6 @@ pub enum TabContent {
     Binary(Entity<HexDiffView>),
     Folder(Entity<FolderDiffView>),
     Merge(Entity<MergeView>),
-    Pasted(Entity<PasteCompareView>),
     Error(SharedString),
 }
 
@@ -67,7 +65,9 @@ pub struct Tab {
     /// Incremented for every comparison started, so stale results are dropped.
     pub generation: u64,
     /// Keeps extracted archives alive while their comparison is shown.
-    pub targets: Vec<CompareTarget>,
+    /// Shared with tabs opened from this one, so extracted archives stay
+    /// on disk until every tab using them has closed.
+    pub targets: Vec<Arc<CompareTarget>>,
     pub subscription: Option<Subscription>,
 }
 

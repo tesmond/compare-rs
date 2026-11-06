@@ -6,6 +6,7 @@
 //! - [`CompareTarget`] classifies paths and unpacks archives for comparison.
 //! - [`EditBuffer`], [`History`], and [`LiveDiff`] support editing a comparison.
 
+mod atomic_write;
 mod binary_diff;
 mod compare_options;
 mod compare_target;
@@ -18,7 +19,9 @@ mod live_diff;
 mod merge_document;
 mod text_diff;
 mod text_document;
+mod text_search;
 
+pub use atomic_write::write_atomically;
 pub use binary_diff::{BYTES_PER_ROW, BinaryDiff};
 pub use compare_options::CompareOptions;
 pub use compare_target::{CompareTarget, TargetKind};
@@ -34,5 +37,6 @@ pub use live_diff::{DiffSide, LiveDiff, RowSplice};
 pub use merge_document::{MergeDocument, MergeRow, OutputLine, Resolution};
 pub use text_diff::{AlignedRow, RowKind, TextDiff};
 pub use text_document::{Encoding, TextDocument};
+pub use text_search::{SearchOptions, SearchQuery};
 
 pub use compare_diff::DiffOptions;

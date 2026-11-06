@@ -25,7 +25,6 @@ pub struct SessionState {
     pub active_tab: usize,
     pub ignore_whitespace: bool,
     pub ignore_case: bool,
-    pub beautify: bool,
     pub word_wrap: bool,
 }
 
@@ -127,7 +126,6 @@ mod tests {
             active_tab: 0,
             ignore_whitespace: true,
             ignore_case: false,
-            beautify: true,
             word_wrap: true,
         };
         let json = serde_json::to_string(&state).expect("serialize");
@@ -139,7 +137,6 @@ mod tests {
         let old = r#"{"window": null, "tabs": [], "active_tab": 0, "ignore_whitespace": true, "ignore_case": false}"#;
         let state: SessionState = serde_json::from_str(old).expect("old sessions still load");
         assert!(state.ignore_whitespace);
-        assert!(!state.beautify);
         assert!(!state.word_wrap);
     }
 
