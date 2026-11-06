@@ -14,15 +14,16 @@ use gpui_component::{Icon, IconName, Sizable, tooltip::Tooltip};
 
 use compare_core::{
     CompareOptions, CompareTarget, ComparisonContent, DiffOptions, FileComparison, FileInfo,
-    FolderComparison, FolderProgress, MergeDocument, TargetKind, TextDiff, TextDocument,
+    FolderComparison, FolderProgress, GitFile, MergeDocument, TargetKind, TextDiff, TextDocument,
 };
 
 use crate::actions::{
     Beautify, CloseTab, Compare, CompareFolders, CopyPaths, FindNext, FindPrev, Merge, NewTab,
-    NewTextCompare, NextDifference, NextTab, OpenFind, OpenFolderLeft, OpenFolderRight, OpenLeft,
-    OpenReplace, OpenRight, PrevDifference, PrevTab, Quit, RevertFile, SaveAll, SaveFile,
-    ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
+    NewTextCompare, NextDifference, NextTab, OpenFind, OpenFolderLeft, OpenFolderRight,
+    OpenGitHistory, OpenLeft, OpenReplace, OpenRight, PrevDifference, PrevTab, Quit, RevertFile,
+    SaveAll, SaveFile, ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
 };
+use crate::app_assets;
 use crate::button::{self, ButtonState, Content, Segment};
 use crate::crash_log;
 use crate::document_syntax::DocumentSyntax;
@@ -58,6 +59,16 @@ enum CompareOutcome {
     Folders {
         comparison: FolderComparison,
         targets: Vec<CompareTarget>,
+    },
+    /// A file's git history, opened on its first two versions.
+    History {
+        file: Arc<GitFile>,
+        /// Version indices shown on the left and right.
+        shown: [usize; 2],
+        infos: [FileInfo; 2],
+        identical: bool,
+        diff: TextDiff,
+        syntax: [DocumentSyntax; 2],
     },
     /// `infos` and `syntax` are ordered left, base, right.
     Merge {
@@ -144,7 +155,7 @@ impl Workspace {
             .tabs
             .iter()
             // Pasted text is not saved.
-            .filter(|tab| tab.kind != TabKind::Text)
+            .filter(|tab| matches!(tab.kind, TabKind::Compare | TabKind::Merge))
             .map(|tab| SavedTab {
                 merge: tab.kind == TabKind::Merge,
                 left: tab.left.clone(),
@@ -356,7 +367,7 @@ impl Workspace {
     fn active_or_new_tab(&mut self, cx: &mut Context<Self>) -> u64 {
         match self.active_tab() {
             // Files chosen while a pasted-text tab is active open a new tab.
-            Some(tab) if tab.kind != TabKind::Text => tab.id,
+            Some(tab) if matches!(tab.kind, TabKind::Compare | TabKind::Merge) => tab.id,
             _ => self.add_tab(TabKind::Compare, cx),
         }
     }
@@ -435,6 +446,22 @@ impl Workspace {
         tab.generation += 1;
         tab.subscription = None;
         let (tab_id, generation, kind) = (tab.id, tab.generation, tab.kind);
+        if kind == TabKind::History {
+            let Some(file) = tab.right.clone() else {
+                return;
+            };
+            tab.content = TabContent::Loading { progress: None };
+            let task =
+                cx.background_executor().spawn(async move { git_history(&file, &options.diff) });
+            cx.spawn(async move |this, cx| {
+                let outcome = task.await;
+                this.update(cx, |this, cx| this.finish_compare(tab_id, generation, outcome, cx))
+                    .ok();
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
         let (Some(left), Some(right)) = (tab.left.clone(), tab.right.clone()) else {
             return;
         };
@@ -445,7 +472,7 @@ impl Workspace {
             (TabKind::Merge, Some(base)) => {
                 Box::new(move || merge_files(&left, &base, &right, &options.diff))
             }
-            (TabKind::Merge, None) | (TabKind::Text, _) => return,
+            (TabKind::Merge, None) | (TabKind::Text | TabKind::History, _) => return,
             (TabKind::Compare, _) => match (TargetKind::of(&left), TargetKind::of(&right)) {
                 (TargetKind::File, TargetKind::File) => {
                     Box::new(move || compare_file_pair(&left, &right, &options))
@@ -588,6 +615,27 @@ impl Workspace {
                 tab.subscription = Some(subscription);
                 TabContent::Folder(view)
             }
+            CompareOutcome::History { file, shown, infos, identical, diff, syntax } => {
+                let (options, wrap) = (self.options.diff, self.wrap);
+                let [left, right] = infos;
+                let [left_syntax, right_syntax] = syntax;
+                let view = cx.new(|cx| {
+                    TextDiffView::new(
+                        left,
+                        right,
+                        identical,
+                        diff,
+                        left_syntax,
+                        right_syntax,
+                        options,
+                        cx,
+                    )
+                    .with_wrap(wrap)
+                    .with_git_history(file, shown)
+                });
+                self.tabs[index].subscription = Some(self.subscribe_to_text_view(&view, cx));
+                TabContent::Text(view)
+            }
             CompareOutcome::Merge { infos, syntax, document } => {
                 let wrap = self.wrap;
                 TabContent::Merge(
@@ -620,8 +668,15 @@ impl Workspace {
     }
 
     /// Opens paths given on the command line: two paths are compared, three
-    /// are merged as `LEFT BASE RIGHT`.
+    /// are merged as `LEFT BASE RIGHT`, and `--history FILE` opens the
+    /// file's git history.
     pub fn open_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if let [flag, file] = paths.as_slice()
+            && flag.as_os_str() == "--history"
+        {
+            self.open_git_history(file.clone(), cx);
+            return;
+        }
         let (kind, sides): (TabKind, &[Side]) = match paths.len() {
             2 => (TabKind::Compare, &[Side::Left, Side::Right]),
             3 => (TabKind::Merge, &[Side::Left, Side::Base, Side::Right]),
@@ -835,6 +890,35 @@ impl Workspace {
 
     /// Reformats JSON, Python dicts, and `\n` escapes on both sides of the
     /// active comparison, as an edit that can be undone.
+    /// Asks for a file and opens its git history in a new tab.
+    fn on_open_git_history(&mut self, _: &OpenGitHistory, _: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Show History".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            if let Some(path) = paths.into_iter().next() {
+                this.update(cx, |this, cx| this.open_git_history(path, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Opens the git history of `path` in a new tab: the file on the right,
+    /// and an earlier version on the left.
+    pub fn open_git_history(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let id = self.add_tab(TabKind::History, cx);
+        if let Some(index) = self.tab_index(id) {
+            self.tabs[index].right = Some(path);
+            self.start_compare(index, cx);
+        }
+    }
+
     fn on_beautify(&mut self, _: &Beautify, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.text_view(self.active).cloned() {
             view.update(cx, |view, cx| view.beautify(cx));
@@ -1074,6 +1158,12 @@ impl Workspace {
                 Content::IconBadge(IconName::FolderOpen, "R"),
                 Box::new(OpenFolderRight),
                 "Open right folder",
+            ))
+            .child(button::separator())
+            .child(open(
+                Content::AppIcon(app_assets::GIT_ICON),
+                Box::new(OpenGitHistory),
+                "Open a file's git history",
             ));
         let actions = group()
             .child(button::primary_action_button(
@@ -1321,6 +1411,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_new_text_compare))
             .on_action(cx.listener(Self::on_beautify))
+            .on_action(cx.listener(Self::on_open_git_history))
             .on_action(cx.listener(Self::on_toggle_word_wrap))
             .on_action(cx.listener(Self::on_open_left))
             .on_action(cx.listener(Self::on_open_right))
@@ -1399,6 +1490,39 @@ fn compare_file_pair(left: &Path, right: &Path, options: &CompareOptions) -> Com
         }
         Err(e) => CompareOutcome::Failed(format!("Could not compare files: {e}")),
     }
+}
+
+/// Opens the git history of `path` and loads the first pair of versions.
+fn git_history(path: &Path, options: &DiffOptions) -> CompareOutcome {
+    let file = match GitFile::open(path) {
+        Ok(file) => Arc::new(file),
+        Err(error) => {
+            return CompareOutcome::Failed(format!("Could not read git history: {error}"));
+        }
+    };
+    let (older, newer) = file.initial_pair();
+    let read = |index: usize| {
+        file.read(index).map_err(|error| format!("Could not read a git version: {error}"))
+    };
+    let (left_bytes, right_bytes) = match (read(older), read(newer)) {
+        (Ok(left), Ok(right)) => (left, right),
+        (Err(error), _) | (_, Err(error)) => return CompareOutcome::Failed(error),
+    };
+    let infos = [
+        file.version_info(older, left_bytes.len() as u64),
+        file.version_info(newer, right_bytes.len() as u64),
+    ];
+    let identical = left_bytes == right_bytes;
+    let diff = TextDiff::new(
+        TextDocument::decode(&left_bytes),
+        TextDocument::decode(&right_bytes),
+        options,
+    );
+    let syntax = [
+        DocumentSyntax::new(file.path(), &diff.left),
+        DocumentSyntax::new(file.path(), &diff.right),
+    ];
+    CompareOutcome::History { file, shown: [older, newer], infos, identical, diff, syntax }
 }
 
 fn merge_files(left: &Path, base: &Path, right: &Path, options: &DiffOptions) -> CompareOutcome {
@@ -1482,6 +1606,7 @@ fn render_welcome() -> Div {
                 .child(shortcut_hint("⇧⌘E", "left folder"))
                 .child(shortcut_hint("⇧⌘R", "right folder"))
                 .child(shortcut_hint("⇧⌘M", "three-way merge"))
+                .child(shortcut_hint("⌥⌘G", "git history"))
                 .child(shortcut_hint("⌘T", "new tab")),
         )
 }

@@ -7,6 +7,7 @@
 mod copying;
 mod editing;
 mod find;
+mod git_versions;
 mod input_handler;
 mod motion;
 mod render;
@@ -73,6 +74,8 @@ pub struct TextDiffView {
     /// The side and row last right-clicked, which context-menu commands act
     /// on (it may be a blank spacer row, which the cursor cannot be on).
     context_row: Option<(DiffSide, usize)>,
+    /// The git history being browsed, if this comparison shows one.
+    git: Option<git_versions::GitState>,
 }
 
 impl TextDiffView {
@@ -117,6 +120,7 @@ impl TextDiffView {
             revision: 0,
             find: None,
             context_row: None,
+            git: None,
         }
     }
 

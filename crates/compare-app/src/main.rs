@@ -4,6 +4,7 @@
 //! folder comparison; three paths open a three-way merge.
 
 mod actions;
+mod app_assets;
 mod app_dirs;
 mod button;
 mod code_text;
@@ -32,8 +33,8 @@ use gpui::{
 
 use crate::actions::{
     Beautify, CloseTab, Compare, CopyPaths, Merge, NewTab, NewTextCompare, NextDifference, NextTab,
-    OpenFolderLeft, OpenFolderRight, OpenLeft, OpenRight, PrevDifference, PrevTab, Quit,
-    RevertFile, SaveAll, SaveFile, ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
+    OpenFolderLeft, OpenFolderRight, OpenGitHistory, OpenLeft, OpenRight, PrevDifference, PrevTab,
+    Quit, RevertFile, SaveAll, SaveFile, ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
 };
 use crate::actions::{
     Copy, CopyBlockToLeft, CopyBlockToRight, CopyLineToLeft, CopyLineToRight, Cut, FindNext,
@@ -46,7 +47,7 @@ const APP_NAME: &str = "compare-rs";
 fn main() {
     crash_log::install();
     let cli_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    Application::new().with_assets(gpui_component_assets::Assets).run(|cx: &mut App| {
+    Application::new().with_assets(app_assets::AppAssets).run(|cx: &mut App| {
         actions::bind_keys(cx);
         cx.on_action(quit);
         cx.set_menus(menus());
@@ -166,6 +167,7 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("New Tab", NewTab),
                 MenuItem::action("New Text Compare", NewTextCompare),
+                MenuItem::action("Open Git History…", OpenGitHistory),
                 MenuItem::separator(),
                 MenuItem::action("Open Left File…", OpenLeft),
                 MenuItem::action("Open Right File…", OpenRight),

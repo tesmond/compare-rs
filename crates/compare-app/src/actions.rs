@@ -7,6 +7,7 @@ actions!(
     [
         NewTab,
         NewTextCompare,
+        OpenGitHistory,
         OpenLeft,
         OpenRight,
         OpenFolderLeft,
@@ -105,6 +106,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-t", NewTab, None),
         KeyBinding::new("cmd-n", NewTextCompare, None),
+        KeyBinding::new("alt-cmd-g", OpenGitHistory, None),
         KeyBinding::new("cmd-shift-b", Beautify, None),
         KeyBinding::new("alt-z", ToggleWordWrap, None),
         KeyBinding::new("cmd-o", OpenLeft, None),

@@ -52,6 +52,8 @@ pub enum Content {
     Icon(IconName),
     /// An icon with a short badge after it, e.g. "L" for the left side.
     IconBadge(IconName, &'static str),
+    /// One of the app's own icons, by asset path.
+    AppIcon(&'static str),
 }
 
 impl From<&'static str> for Content {
@@ -220,6 +222,9 @@ fn content_element(content: Content) -> AnyElement {
     match content {
         Content::Label(label) => label.into_any_element(),
         Content::Icon(icon) => Icon::new(icon).with_size(px(ICON_SIZE)).into_any_element(),
+        Content::AppIcon(path) => {
+            Icon::empty().path(path).with_size(px(ICON_SIZE)).into_any_element()
+        }
         Content::IconBadge(icon, badge) => div()
             .flex()
             .items_center()
@@ -241,7 +246,7 @@ fn styled(
     corners: Corners,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
-    let icon_only = matches!(content, Content::Icon(_));
+    let icon_only = matches!(content, Content::Icon(_) | Content::AppIcon(_));
     let base = div()
         .id(id)
         .flex()

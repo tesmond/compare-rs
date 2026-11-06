@@ -169,6 +169,7 @@ impl TextDiffView {
         state.path = Some(path.clone());
         state.disk_modified = info.modified;
         state.info = info;
+        self.forget_blame(side);
         cx.emit(TextDiffEvent::Saved(path));
         cx.notify();
     }
@@ -191,14 +192,33 @@ impl TextDiffView {
             }
         };
         let document = TextDocument::decode(&bytes);
+        let info = FileInfo::from_path(&path);
+        self.replace_side(side, &document, &path, info, cx);
         let state = self.side_mut(side);
-        state.buffer = EditBuffer::from_document(&document);
-        state.syntax = DocumentSyntax::new(&path, &document);
+        state.disk_modified = state.info.modified;
+        cx.notify();
+    }
+}
+
+impl TextDiffView {
+    /// Replaces the whole text of `side` with `document` (a reload, not an
+    /// edit: undo history is cleared) and re-diffs. `syntax_path` picks the
+    /// highlighting language.
+    pub(super) fn replace_side(
+        &mut self,
+        side: DiffSide,
+        document: &TextDocument,
+        syntax_path: &Path,
+        info: FileInfo,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.side_mut(side);
+        state.buffer = EditBuffer::from_document(document);
+        state.syntax = DocumentSyntax::new(syntax_path, document);
         state.syntax.cover(state.buffer.lines());
         state.history.reset();
-        state.read_only = read_only_reason(&document);
-        state.info = FileInfo::from_path(&path);
-        state.disk_modified = state.info.modified;
+        state.read_only = read_only_reason(document);
+        state.info = info;
         state.marked = None;
         let head = state.buffer.clamp(state.selection.head);
         state.selection = super::side::Selection::caret(head);

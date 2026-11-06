@@ -19,6 +19,8 @@ pub enum TabKind {
     Merge,
     /// Compares text pasted into the app rather than files.
     Text,
+    /// Browses one file's git history; `right` holds the file.
+    History,
 }
 
 /// One input slot of a tab.
@@ -107,7 +109,7 @@ impl Tab {
         match self.kind {
             TabKind::Compare => &[Side::Left, Side::Right],
             TabKind::Merge => &[Side::Left, Side::Base, Side::Right],
-            TabKind::Text => &[],
+            TabKind::Text | TabKind::History => &[],
         }
     }
 
@@ -127,6 +129,10 @@ impl Tab {
         };
         if self.kind == TabKind::Text {
             return "Text Compare".to_owned();
+        }
+        if self.kind == TabKind::History {
+            let file = name(self.right.as_deref()).unwrap_or_else(|| "File".to_owned());
+            return format!("{file} · history");
         }
         let prefix = if self.kind == TabKind::Merge { "Merge: " } else { "" };
         match (name(self.left.as_deref()), name(self.right.as_deref())) {

@@ -6,8 +6,8 @@ use std::rc::Rc;
 use gpui::{
     AnyElement, ClickEvent, Context, CursorStyle, Div, ElementInputHandler, Hsla,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Render, ScrollWheelEvent, StatefulInteractiveElement, Styled, WeakEntity,
-    Window, canvas, div, list, px,
+    ParentElement, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, canvas, div, list, px,
 };
 
 use compare_core::{DiffSide, RowKind};
@@ -15,7 +15,9 @@ use compare_diff::InlineDiff;
 
 use super::TextDiffView;
 use super::editing::Motion;
+use super::git_versions::Step;
 use gpui_component::IconName;
+use gpui_component::tooltip::Tooltip;
 
 use crate::actions::{
     Backspace, CloseFind, CollapseSelection, Copy, CopyBlockToLeft, CopyBlockToRight,
@@ -327,18 +329,36 @@ impl TextDiffView {
             .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
                 this.mouse_drag(side, row, event, cx);
             }))
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(GUTTER_WIDTH))
-                    .pr(px(TEXT_PADDING))
-                    .flex()
-                    .justify_end()
-                    .text_color(theme::gutter())
-                    .bg(theme::mantle())
-                    .child(number),
-            )
+            .child(self.render_gutter(side, line, number))
             .child(div().flex_1().min_w_0().pl(px(TEXT_PADDING)).overflow_hidden().child(text))
+    }
+
+    /// The line-number gutter. In a git history view, hovering the number
+    /// shows the line's blame.
+    fn render_gutter(&self, side: DiffSide, line: Option<usize>, number: String) -> AnyElement {
+        let gutter = div()
+            .flex_none()
+            .w(px(GUTTER_WIDTH))
+            .pr(px(TEXT_PADDING))
+            .flex()
+            .justify_end()
+            .text_color(theme::gutter())
+            .bg(theme::mantle())
+            .child(number);
+        let Some((line, hint)) = line.and_then(|line| Some((line, self.blame_hint(side, line)?)))
+        else {
+            return gutter.into_any_element();
+        };
+        let id = match side {
+            DiffSide::Left => "blame-left",
+            DiffSide::Right => "blame-right",
+        };
+        let hint = SharedString::from(hint);
+        gutter
+            .id((id, line))
+            .hover(|style| style.text_color(theme::text()))
+            .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+            .into_any_element()
     }
 
     /// The text of `line` on `side` with syntax colors, changed words,
@@ -426,15 +446,21 @@ impl TextDiffView {
         let header = |side: DiffSide, cx: &mut Context<Self>| {
             let state = self.side(side);
             let modified = state.is_modified();
-            let name = state.display_name();
+            let git = self.is_git_history();
+            let name = if git { format::file_name(&state.info.path) } else { state.display_name() };
             let name = if modified { format!("● {name}") } else { name };
-            let folder = match &state.path {
-                Some(path) => file_header::folder_label(path),
-                None => "Not saved yet".to_owned(),
+            let folder = match (self.version_label(side), &state.path) {
+                (Some(version), _) => version,
+                (None, Some(path)) => file_header::folder_label(path),
+                (None, None) => "Not saved yet".to_owned(),
             };
-            // Size and date compare with the other side when both are files.
+            // A side has details when it is a file or a committed version.
+            let has_details = |state: &super::side::SideState| {
+                state.path.is_some() || (git && state.info.modified.is_some())
+            };
+            // Size and date compare with the other side when both have them.
             let other = self.side(side.other());
-            let counterpart = other.path.is_some().then_some(Counterpart {
+            let counterpart = has_details(other).then_some(Counterpart {
                 info: &other.info,
                 name: match side {
                     DiffSide::Left => "right file",
@@ -451,14 +477,13 @@ impl TextDiffView {
                 .items_center()
                 .gap_1()
                 .children(state.read_only.clone())
-                .children((state.read_only.is_some() && state.path.is_some()).then_some("·"))
+                .children((state.read_only.is_some() && has_details(state)).then_some("·"))
                 .children(
-                    state
-                        .path
-                        .is_some()
+                    has_details(state)
                         .then(|| file_header::file_details(id, &state.info, counterpart)),
                 );
-            let pickers = self.file_backed.then(|| {
+            let navigation = git.then(|| self.render_version_steps(side, cx));
+            let pickers = (self.file_backed && !git).then(|| {
                 let (file, folder): (Box<dyn gpui::Action>, Box<dyn gpui::Action>) = match side {
                     DiffSide::Left => (Box::new(OpenLeft), Box::new(OpenFolderLeft)),
                     DiffSide::Right => (Box::new(OpenRight), Box::new(OpenFolderRight)),
@@ -503,6 +528,7 @@ impl TextDiffView {
                 button::Hint::text("Discard unsaved changes to this side"),
             );
             file_header::titled_header(name, folder, details)
+                .children(navigation)
                 .children(pickers)
                 .child(save)
                 .child(revert)
@@ -525,6 +551,35 @@ impl TextDiffView {
             .child(divider())
             .child(header(DiffSide::Right, cx))
             .child(spacer(MARKER_WIDTH))
+    }
+
+    /// Older and newer buttons that step one side through the file's git
+    /// history; a direction with no further changes is disabled.
+    fn render_version_steps(&self, side: DiffSide, cx: &mut Context<Self>) -> Div {
+        let step = |step: Step, icon: IconName, cx: &mut Context<Self>| {
+            let available =
+                self.step_target(side, step).is_some() && self.step_blocked(side).is_none();
+            let id = match (side, step) {
+                (DiffSide::Left, Step::Older) => "left-older",
+                (DiffSide::Left, Step::Newer) => "left-newer",
+                (DiffSide::Right, Step::Older) => "right-older",
+                (DiffSide::Right, Step::Newer) => "right-newer",
+            };
+            Segment::new(
+                id,
+                icon,
+                ButtonState::enabled(available),
+                button::Hint::text(self.step_hint(side, step)),
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    window.focus(&this.focus);
+                    this.step_version(side, step, cx);
+                }),
+            )
+        };
+        button::segmented(vec![
+            step(Step::Older, IconName::ArrowLeft, cx),
+            step(Step::Newer, IconName::ArrowRight, cx),
+        ])
     }
 
     fn render_banner(&self) -> Option<Div> {
@@ -669,6 +724,7 @@ impl Render for TextDiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Lines re-register their layouts as they are painted.
         self.layouts.borrow_mut().clear();
+        self.ensure_blame(cx);
         let input_handler = {
             let focus = self.focus.clone();
             let entity = cx.entity();
