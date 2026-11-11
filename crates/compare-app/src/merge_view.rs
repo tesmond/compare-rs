@@ -25,6 +25,14 @@ use crate::horizontal_scroll::HorizontalScroll;
 use crate::path_actions;
 use crate::theme;
 
+/// Where a merge of a git conflict's stages came from.
+pub struct GitConflict {
+    /// The working file, which the merged result replaces.
+    pub path: PathBuf,
+    /// Header titles for the left, base, and right panes.
+    pub titles: [String; 3],
+}
+
 /// Lets the user resolve conflicts between three files and save the result.
 pub struct MergeView {
     focus: FocusHandle,
@@ -45,6 +53,8 @@ pub struct MergeView {
     message: Option<(SharedString, Hsla)>,
     /// Whether long lines wrap.
     wrap: bool,
+    /// Set when the inputs are a git conflict's stages rather than files.
+    conflict: Option<GitConflict>,
 }
 
 impl MergeView {
@@ -79,7 +89,15 @@ impl MergeView {
             output_list: ListState::new(output_rows, ListAlignment::Top, px(300.0)),
             message: None,
             wrap: false,
+            conflict: None,
         }
+    }
+
+    /// Marks the inputs as the stages of `conflict`: the panes are titled
+    /// for the stages, and saving suggests the working file.
+    pub fn with_git_conflict(mut self, conflict: Option<GitConflict>) -> Self {
+        self.conflict = conflict;
+        self
     }
 
     /// Sets whether long lines wrap.
@@ -204,13 +222,16 @@ impl MergeView {
 
     fn save(&mut self, cx: &mut Context<Self>) {
         let directory = self.base.path.parent().map(PathBuf::from).unwrap_or_default();
-        let suggested = format!(
-            "{}.merged",
-            self.base
-                .path
-                .file_name()
-                .map_or_else(|| "merged".to_owned(), |name| name.to_string_lossy().into_owned(),)
-        );
+        let file_name = self
+            .base
+            .path
+            .file_name()
+            .map_or_else(|| "merged".to_owned(), |name| name.to_string_lossy().into_owned());
+        // A git conflict is resolved in place; other merges get a new file.
+        let (suggested, resolving_conflict) = match &self.conflict {
+            Some(_) => (file_name, true),
+            None => (format!("{file_name}.merged"), false),
+        };
         let receiver = cx.prompt_for_new_path(&directory, Some(&suggested));
         let (text, unresolved) = match &self.editor {
             Some(editor) => {
@@ -246,6 +267,13 @@ impl MergeView {
                         path.display()
                     )),
                     theme::yellow(),
+                ),
+                Ok(()) if resolving_conflict => (
+                    SharedString::from(format!(
+                        "Saved {}. Run git add to mark the conflict resolved.",
+                        path.display()
+                    )),
+                    theme::green(),
                 ),
                 Ok(()) => (SharedString::from(format!("Saved {}", path.display())), theme::green()),
                 Err(e) => {
@@ -583,6 +611,45 @@ impl MergeView {
     }
 }
 
+impl MergeView {
+    /// Headers of the left, base, and right panes, with dividers between.
+    fn input_headers(&self) -> Vec<Div> {
+        let divider = || div().w(px(1.0)).bg(theme::surface());
+        let headers = match &self.conflict {
+            Some(conflict) => {
+                let infos = [&self.left, &self.base, &self.right];
+                let titled = |index: usize| {
+                    file_header::titled_header(
+                        conflict.titles[index].clone(),
+                        file_header::folder_label(&conflict.path),
+                        format::format_size(infos[index].size),
+                    )
+                };
+                [titled(0), titled(1), titled(2)]
+            }
+            None => [
+                file_header::file_header(
+                    "merge-left",
+                    &self.left,
+                    Some(Counterpart { info: &self.base, name: "base" }),
+                ),
+                file_header::titled_header(
+                    format!("Base: {}", format::file_name(&self.base.path)),
+                    file_header::folder_label(&self.base.path),
+                    format::format_size(self.base.size),
+                ),
+                file_header::file_header(
+                    "merge-right",
+                    &self.right,
+                    Some(Counterpart { info: &self.base, name: "base" }),
+                ),
+            ],
+        };
+        let [left, base, right] = headers;
+        vec![left, divider(), base, divider(), right]
+    }
+}
+
 impl Render for MergeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -590,28 +657,7 @@ impl Render for MergeView {
             .flex_col()
             .size_full()
             .child(self.render_toolbar(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .child(file_header::file_header(
-                        "merge-left",
-                        &self.left,
-                        Some(Counterpart { info: &self.base, name: "base" }),
-                    ))
-                    .child(div().w(px(1.0)).bg(theme::surface()))
-                    .child(file_header::titled_header(
-                        format!("Base: {}", format::file_name(&self.base.path)),
-                        file_header::folder_label(&self.base.path),
-                        format::format_size(self.base.size),
-                    ))
-                    .child(div().w(px(1.0)).bg(theme::surface()))
-                    .child(file_header::file_header(
-                        "merge-right",
-                        &self.right,
-                        Some(Counterpart { info: &self.base, name: "base" }),
-                    )),
-            )
+            .child(div().flex().flex_row().children(self.input_headers()))
             .child(
                 div().flex_grow().flex_basis(px(0.0)).min_h_0().child(
                     path_actions::with_file_pair_menu(

@@ -68,6 +68,10 @@ pub struct FolderDiffView {
     expanded: Vec<bool>,
     /// Node indices currently shown, in display order.
     visible: Vec<usize>,
+    /// For each node, how many files under it differ (0 for files).
+    hidden_differences: Vec<usize>,
+    /// Each node's folder, if it is not at the top level.
+    parents: Vec<Option<usize>>,
     selected: Option<usize>,
     sort: SortColumn,
     ascending: bool,
@@ -84,15 +88,20 @@ impl Focusable for FolderDiffView {
 }
 
 impl FolderDiffView {
-    /// Creates the view. Directories containing differences start expanded.
+    /// Creates the view. Every directory starts collapsed.
     pub fn new(
         comparison: FolderComparison,
         left_label: String,
         right_label: String,
         cx: &mut Context<Self>,
     ) -> Self {
-        let expanded =
-            comparison.nodes.iter().map(|node| node.status != FolderStatus::Identical).collect();
+        let expanded = vec![false; comparison.nodes.len()];
+        let mut parents = vec![None; comparison.nodes.len()];
+        for (index, node) in comparison.nodes.iter().enumerate() {
+            for &child in &node.children {
+                parents[child] = Some(index);
+            }
+        }
         let mut view = Self {
             focus: cx.focus_handle(),
             comparison,
@@ -100,6 +109,8 @@ impl FolderDiffView {
             right_label,
             expanded,
             visible: Vec::new(),
+            hidden_differences: Vec::new(),
+            parents,
             selected: None,
             sort: SortColumn::Name,
             ascending: true,
@@ -156,21 +167,48 @@ impl FolderDiffView {
         self.select_difference(false, cx);
     }
 
+    /// Selects the next (or previous) differing file in tree order,
+    /// including files inside collapsed folders, which are opened to show it.
     fn select_difference(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let position = self.selected_position();
+        let mut order = Vec::with_capacity(self.comparison.nodes.len());
+        let roots = self.sorted(&self.comparison.roots);
+        self.push_all(&roots, &mut order);
+        let position = self.selected.and_then(|selected| order.iter().position(|&n| n == selected));
         let is_difference = |&&node: &&usize| {
             let node = &self.comparison.nodes[node];
             node.status != FolderStatus::Identical && !node.is_dir()
         };
         let found = if forward {
             let start = position.map_or(0, |p| p + 1);
-            self.visible[start.min(self.visible.len())..].iter().find(is_difference).copied()
+            order[start.min(order.len())..].iter().find(is_difference).copied()
         } else {
-            let end = position.unwrap_or(self.visible.len());
-            self.visible[..end].iter().rev().find(is_difference).copied()
+            let end = position.unwrap_or(order.len());
+            order[..end].iter().rev().find(is_difference).copied()
         };
-        if let Some(node) = found {
-            self.select(node, cx);
+        let Some(node) = found else {
+            return;
+        };
+        let mut parent = self.parents[node];
+        while let Some(folder) = parent {
+            self.expanded[folder] = true;
+            parent = self.parents[folder];
+        }
+        self.rebuild_visible();
+        self.select(node, cx);
+    }
+
+    /// Every node in display order, as if all folders were expanded.
+    fn push_all(&self, nodes: &[usize], order: &mut Vec<usize>) {
+        for &index in nodes {
+            let node = &self.comparison.nodes[index];
+            if self.differences_only && node.status == FolderStatus::Identical {
+                continue;
+            }
+            order.push(index);
+            if node.is_dir() {
+                let children = self.sorted(&node.children);
+                self.push_all(&children, order);
+            }
         }
     }
 
@@ -188,6 +226,7 @@ impl FolderDiffView {
     }
 
     fn rebuild_visible(&mut self) {
+        self.hidden_differences = difference_counts(&self.comparison);
         let mut visible = Vec::with_capacity(self.visible.len().max(self.comparison.roots.len()));
         let roots = self.sorted(&self.comparison.roots);
         self.push_visible(&roots, &mut visible);
@@ -258,6 +297,30 @@ impl FolderDiffView {
             self.rebuild_visible();
             cx.notify();
         }
+    }
+
+    /// Expands or collapses every directory.
+    fn set_all_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        for (index, node) in self.comparison.nodes.iter().enumerate() {
+            if node.is_dir() {
+                self.expanded[index] = expanded;
+            }
+        }
+        self.rebuild_visible();
+        // A collapsed folder may now hide the selected entry.
+        if self.selected_position().is_none() {
+            self.selected = None;
+        }
+        cx.notify();
+    }
+
+    /// Selects a directory and flips its expansion.
+    fn toggle_dir(&mut self, node: usize, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        self.selected = Some(node);
+        let expanded = !self.expanded[node];
+        self.set_expanded(node, expanded, cx);
+        cx.notify();
     }
 
     /// Opens a file pair or toggles a directory.
@@ -413,9 +476,9 @@ impl FolderDiffView {
                         this.on_row_click(index, event, window, cx);
                     }))
                     .child(div().flex_none().w(px(3.0)).h_full().bg(status_color(node.status)))
-                    .child(entry_cell(node, node.left, expanded))
+                    .child(self.entry_cell(index, node.left, expanded, Side::Left, cx))
                     .child(div().flex_none().w(px(1.0)).h_full().bg(theme::surface()))
-                    .child(entry_cell(node, node.right, expanded))
+                    .child(self.entry_cell(index, node.right, expanded, Side::Right, cx))
             })
             .collect()
     }
@@ -457,62 +520,136 @@ impl FolderDiffView {
                 cx,
             )))
     }
-}
 
-/// One side of a tree row.
-fn entry_cell(node: &FolderNode, meta: Option<EntryMeta>, expanded: bool) -> Div {
-    let cell =
-        div().flex().flex_row().flex_1().min_w_0().h_full().items_center().px_2().overflow_hidden();
-    let Some(meta) = meta else {
-        return cell.bg(theme::filler_bg());
-    };
-    let is_dir = meta.kind == compare_core::EntryKind::Dir;
-    let disclosure = match (is_dir, expanded) {
-        (false, _) => " ",
-        (true, true) => "▾",
-        (true, false) => "▸",
-    };
-    let icon = if is_dir { IconName::Folder } else { IconName::File };
-    let size = if is_dir { String::new() } else { format::format_size(meta.size) };
-    cell.child(
-        div()
+    /// One side of a tree row. A collapsed folder that hides differences
+    /// says how many, and its arrow and that note expand it on click.
+    fn entry_cell(
+        &self,
+        index: usize,
+        meta: Option<EntryMeta>,
+        expanded: bool,
+        side: Side,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let node = &self.comparison.nodes[index];
+        let cell = div()
             .flex()
             .flex_row()
             .flex_1()
             .min_w_0()
+            .h_full()
             .items_center()
-            .gap_1()
-            .pl(px(f32::from(node.depth) * INDENT_WIDTH))
-            .child(div().flex_none().w(px(10.0)).text_color(theme::muted()).child(disclosure))
-            .child(Icon::new(icon).with_size(px(14.0)).text_color(theme::subtext()))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(name_color(node.status))
-                    .child(node.name.clone()),
-            ),
-    )
-    .child(
-        div()
-            .flex_none()
-            .w(px(SIZE_COLUMN_WIDTH))
-            .flex()
-            .justify_end()
-            .text_size(theme::ui_text_size())
-            .text_color(theme::subtext())
-            .child(size),
-    )
-    .child(
-        div()
-            .flex_none()
-            .w(px(TIME_COLUMN_WIDTH))
-            .pl_3()
-            .text_size(theme::ui_text_size())
-            .text_color(theme::muted())
-            .whitespace_nowrap()
-            .child(format::format_time(meta.modified)),
-    )
+            .px_2()
+            .overflow_hidden();
+        let Some(meta) = meta else {
+            return cell.bg(theme::filler_bg());
+        };
+        let is_dir = meta.kind == compare_core::EntryKind::Dir;
+        let disclosure = match (is_dir, expanded) {
+            (false, _) => " ",
+            (true, true) => "▾",
+            (true, false) => "▸",
+        };
+        let toggle = |id: &'static str, cx: &mut Context<Self>| {
+            div()
+                .id(SharedString::from(format!("{id}-{side:?}-{index}")))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                        // Keep the row from also seeing this as a click.
+                        cx.stop_propagation();
+                        this.toggle_dir(index, window, cx);
+                    }),
+                )
+        };
+        let arrow = if is_dir {
+            toggle("disclosure", cx)
+                .hover(|style| style.text_color(theme::text()))
+                .child(disclosure)
+                .into_any_element()
+        } else {
+            div().child(disclosure).into_any_element()
+        };
+        let hidden = self.hidden_differences[index];
+        let badge = (is_dir && !expanded && hidden > 0).then(|| {
+            let label = match hidden {
+                1 => "1 difference ▸".to_owned(),
+                count => format!("{count} differences ▸"),
+            };
+            toggle("expand-hint", cx)
+                .flex_none()
+                .ml_2()
+                .px(px(6.0))
+                .rounded(px(3.0))
+                .bg(theme::surface())
+                .text_size(theme::meta_text_size())
+                .text_color(theme::subtext())
+                .hover(|style| style.bg(theme::surface_bright()).text_color(theme::text()))
+                .child(label)
+        });
+        let icon = if is_dir { IconName::Folder } else { IconName::File };
+        let size = if is_dir { String::new() } else { format::format_size(meta.size) };
+        cell.child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_1()
+                .pl(px(f32::from(node.depth) * INDENT_WIDTH))
+                .child(div().flex_none().w(px(10.0)).text_color(theme::muted()).child(arrow))
+                .child(Icon::new(icon).with_size(px(14.0)).text_color(theme::subtext()))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(name_color(node.status))
+                        .child(node.name.clone()),
+                )
+                .children(badge),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(SIZE_COLUMN_WIDTH))
+                .flex()
+                .justify_end()
+                .text_size(theme::ui_text_size())
+                .text_color(theme::subtext())
+                .child(size),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(TIME_COLUMN_WIDTH))
+                .pl_3()
+                .text_size(theme::ui_text_size())
+                .text_color(theme::muted())
+                .whitespace_nowrap()
+                .child(format::format_time(meta.modified)),
+        )
+    }
+}
+
+/// For each node, how many files at or below it are not identical.
+fn difference_counts(comparison: &FolderComparison) -> Vec<usize> {
+    fn count(comparison: &FolderComparison, index: usize, counts: &mut [usize]) -> usize {
+        let node = &comparison.nodes[index];
+        let total = if node.is_dir() {
+            node.children.iter().map(|&child| count(comparison, child, counts)).sum()
+        } else {
+            usize::from(node.status != FolderStatus::Identical)
+        };
+        counts[index] = total;
+        total
+    }
+    let mut counts = vec![0; comparison.nodes.len()];
+    for &root in &comparison.roots {
+        count(comparison, root, &mut counts);
+    }
+    counts
 }
 
 fn status_color(status: FolderStatus) -> Hsla {
@@ -589,9 +726,21 @@ impl Render for FolderDiffView {
                         filter_state,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_differences_only(cx)),
                     ))
+                    .child(button::button(
+                        "expand-all",
+                        "Expand all",
+                        ButtonState::Enabled,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.set_all_expanded(true, cx)),
+                    ))
+                    .child(button::button(
+                        "collapse-all",
+                        "Collapse all",
+                        ButtonState::Enabled,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.set_all_expanded(false, cx)),
+                    ))
                     .child(
                         div().text_size(theme::meta_text_size()).text_color(theme::muted()).child(
-                            "Double-click or press Enter to compare files · ←/→ collapse/expand",
+                            "Click ▸ to open a folder · double-click or Enter to compare files · ←/→ collapse/expand",
                         ),
                     ),
             )
@@ -645,5 +794,49 @@ impl Render for FolderDiffView {
                         }
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use compare_core::{FolderProgress, compare_folders};
+
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        fs::write(path, contents).expect("write");
+    }
+
+    #[test]
+    fn counts_differing_files_under_each_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+        for root in [&left, &right] {
+            write(&root.join("same/inner/s.txt"), "same");
+        }
+        write(&left.join("a/b/x.txt"), "left");
+        write(&right.join("a/b/x.txt"), "right");
+        write(&left.join("a/y.txt"), "l");
+        write(&right.join("a/y.txt"), "r");
+        write(&right.join("a/b/new.txt"), "only right");
+
+        let comparison =
+            compare_folders(&left, &right, &FolderProgress::default()).expect("compare");
+        let counts = difference_counts(&comparison);
+        let count_of = |relative: &str| {
+            let index = comparison
+                .nodes
+                .iter()
+                .position(|node| node.relative_path == Path::new(relative))
+                .unwrap_or_else(|| panic!("no node for {relative}"));
+            counts[index]
+        };
+        assert_eq!(count_of("a"), 3);
+        assert_eq!(count_of("a/b"), 2);
+        assert_eq!(count_of("same"), 0);
+        assert_eq!(count_of("same/inner"), 0);
     }
 }

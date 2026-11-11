@@ -29,15 +29,17 @@ pub struct Mark {
     pub range: Range<usize>,
     pub background: Option<Hsla>,
     pub underline: Option<Hsla>,
+    /// Text color, overriding the syntax color.
+    pub foreground: Option<Hsla>,
 }
 
 impl Mark {
     pub fn background(range: Range<usize>, color: Hsla) -> Self {
-        Self { range, background: Some(color), underline: None }
+        Self { range, background: Some(color), underline: None, foreground: None }
     }
 
     pub fn underline(range: Range<usize>, color: Hsla) -> Self {
-        Self { range, background: None, underline: Some(color) }
+        Self { range, background: None, underline: Some(color), foreground: None }
     }
 }
 
@@ -75,17 +77,19 @@ fn merge_highlights(
         let token = tokens.get(token_index).filter(|t| t.range.start <= segment.start);
         let mut background = None;
         let mut underline = None;
+        let mut foreground = None;
         for mark in marks {
             if mark.range.start <= segment.start && segment.end <= mark.range.end {
                 background = mark.background.or(background);
                 underline = mark.underline.or(underline);
+                foreground = mark.foreground.or(foreground);
             }
         }
-        if token.is_none() && background.is_none() && underline.is_none() {
+        if token.is_none() && background.is_none() && underline.is_none() && foreground.is_none() {
             continue;
         }
         let style = HighlightStyle {
-            color: token.map(|t| token_color(t.kind)),
+            color: foreground.or(token.map(|t| token_color(t.kind))),
             font_style: token.filter(|t| t.kind == TokenKind::Comment).map(|_| FontStyle::Italic),
             background_color: background,
             underline: underline.map(|color| UnderlineStyle {

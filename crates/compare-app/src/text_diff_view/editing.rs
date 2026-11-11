@@ -289,12 +289,50 @@ impl TextDiffView {
     pub(super) fn reveal_cursor(&mut self) {
         let head = self.active_side().selection.head;
         let row = self.diff.row_of_line(self.active, head.line);
-        self.list.scroll_to_reveal_item(row);
+        self.reveal_row(row);
         if !self.wrap {
             let column =
                 format::display_column(self.active_side().buffer.line(head.line), head.column);
             self.horizontal.reveal(column, self.text_area_width());
         }
+    }
+
+    /// Scrolls so `row` is visible. A row next to the viewport is scrolled
+    /// in by the smallest amount; one further away is placed a third of the
+    /// way down, with context above it.
+    ///
+    /// GPUI's `scroll_to_reveal_item` alone is not enough: rows that have
+    /// never been painted count as zero height, so for a distant row it
+    /// computes the wrong offset and often does not scroll at all.
+    pub(super) fn reveal_row(&mut self, row: usize) {
+        let viewport = self.list.viewport_bounds();
+        let rows_in_view = ((viewport.size.height / theme::row_height()) as usize).max(1);
+        let top = self.list.logical_scroll_top();
+        // Rows are at least one row height tall, so nothing further than
+        // `rows_in_view` below the top row can be on screen.
+        let near = row + 1 >= top.item_ix && row <= top.item_ix + rows_in_view;
+        if let Some(bounds) = self.list.bounds_for_item(row)
+            && near
+            && bounds.top() >= viewport.top()
+            && bounds.bottom() <= viewport.bottom()
+        {
+            return;
+        }
+        // Revealing a row at or above the top needs no heights; below, the
+        // rows in between must have been painted for the offset to be right.
+        let adjacent = if row <= top.item_ix {
+            near
+        } else {
+            near && self.list.bounds_for_item(row - 1).is_some()
+        };
+        if adjacent {
+            self.list.scroll_to_reveal_item(row);
+            return;
+        }
+        self.list.scroll_to(gpui::ListOffset {
+            item_ix: row.saturating_sub(rows_in_view / 3),
+            offset_in_item: px(0.0),
+        });
     }
 
     /// Width of one side's text area (excluding the line-number gutter).

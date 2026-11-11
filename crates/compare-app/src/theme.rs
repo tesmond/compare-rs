@@ -101,14 +101,27 @@ pub fn selection_inactive() -> Hsla {
     rgba(0x9399b255).into()
 }
 
-/// Background of text matching the find pattern.
+/// Background of text matching the find pattern. Solid and dark, so the
+/// light match text stays readable over any line background (a
+/// translucent yellow blended to the same brightness as grey text).
 pub fn find_match() -> Hsla {
-    rgba(0xf9e2af66).into()
+    color(0x5a4a1f)
 }
 
-/// Background of the selected find match.
+/// Text of a find match that is not the selected one.
+pub fn find_match_text() -> Hsla {
+    text()
+}
+
+/// Background of the selected find match: solid, so it stands out from
+/// the other matches and from the selection.
 pub fn find_current() -> Hsla {
-    rgba(0xfab387aa).into()
+    color(0xfab387)
+}
+
+/// Text of the selected find match, dark to read on its background.
+pub fn find_current_text() -> Hsla {
+    color(0x11111b)
 }
 
 pub fn cursor() -> Hsla {
@@ -160,4 +173,35 @@ pub fn both_changed_bg() -> Hsla {
 /// Background of the empty filler opposite an inserted or deleted line.
 pub fn filler_bg() -> Hsla {
     color(0x161622)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG relative luminance.
+    fn luminance(color: Hsla) -> f32 {
+        let rgb = color.to_rgb();
+        let linear = |c: f32| {
+            if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b)
+    }
+
+    fn contrast(a: Hsla, b: Hsla) -> f32 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn find_highlights_keep_text_readable() {
+        // WCAG AA for normal text.
+        const MINIMUM: f32 = 4.5;
+        let current = contrast(find_current_text(), find_current());
+        let other = contrast(find_match_text(), find_match());
+        assert!(current >= MINIMUM, "current match contrast {current:.2}");
+        assert!(other >= MINIMUM, "other match contrast {other:.2}");
+        // The two kinds of match must look clearly different.
+        assert!(contrast(find_current(), find_match()) >= 3.0);
+    }
 }

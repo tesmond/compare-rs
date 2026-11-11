@@ -105,7 +105,7 @@ pub fn button(
     state: ButtonState,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
-    styled(id.into(), content.into(), state, Corners::All, on_click)
+    styled(id.into(), content.into(), state, Corners::All, Palette::Normal, on_click)
 }
 
 /// A button that dispatches `action` when clicked, with `hint` (and the
@@ -116,12 +116,22 @@ pub fn action_button(
     state: ButtonState,
     hint: impl Into<SharedString>,
 ) -> Stateful<Div> {
+    action_button_in(content, action, state, hint, Palette::Normal)
+}
+
+fn action_button_in(
+    content: impl Into<Content>,
+    action: Box<dyn Action>,
+    state: ButtonState,
+    hint: impl Into<SharedString>,
+    palette: Palette,
+) -> Stateful<Div> {
     let id = ElementId::Name(format!("action-{}", action.name()).into());
     let tooltip = Hint::action(hint, action.as_ref());
     let on_click = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
         window.dispatch_action(action.boxed_clone(), cx);
     };
-    with_hint(styled(id, content.into(), state, Corners::All, on_click), tooltip)
+    with_hint(styled(id, content.into(), state, Corners::All, palette, on_click), tooltip)
 }
 
 /// The one prominent button of a toolbar.
@@ -131,14 +141,9 @@ pub fn primary_action_button(
     state: ButtonState,
     hint: impl Into<SharedString>,
 ) -> Stateful<Div> {
-    let button = action_button(label, action, state, hint).px_3().font_weight(FontWeight::SEMIBOLD);
-    match state {
-        ButtonState::Disabled => button,
-        ButtonState::Enabled | ButtonState::Active => button
-            .bg(theme::accent())
-            .text_color(theme::crust())
-            .hover(|style| style.bg(theme::text()).text_color(theme::crust())),
-    }
+    action_button_in(label, action, state, hint, Palette::Primary)
+        .px_3()
+        .font_weight(FontWeight::SEMIBOLD)
 }
 
 /// Adds a hover tooltip to a button.
@@ -208,7 +213,8 @@ pub fn segmented(segments: Vec<Segment>) -> Div {
             group = group.child(div().w(px(1.0)).h(px(16.0)).bg(theme::surface_bright()));
         }
         let Segment { id, content, state, hint, on_click } = segment;
-        group = group.child(with_hint(styled(id, content, state, corners, on_click), hint));
+        group = group
+            .child(with_hint(styled(id, content, state, corners, Palette::Normal, on_click), hint));
     }
     group
 }
@@ -237,6 +243,14 @@ fn content_element(content: Content) -> AnyElement {
     }
 }
 
+/// Colors of an enabled button.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Palette {
+    Normal,
+    /// The one prominent button of a toolbar.
+    Primary,
+}
+
 /// Builds a button in one of the three states. Every state keeps a 1px
 /// border (transparent unless active) so toggling never shifts the layout.
 fn styled(
@@ -244,6 +258,7 @@ fn styled(
     content: Content,
     state: ButtonState,
     corners: Corners,
+    palette: Palette,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let icon_only = matches!(content, Content::Icon(_) | Content::AppIcon(_));
@@ -267,16 +282,24 @@ fn styled(
         Corners::Right => base.rounded_r(radius),
         Corners::None => base,
     };
-    match state {
-        ButtonState::Disabled => base.text_color(theme::muted()).cursor_default(),
-        ButtonState::Enabled => base
+    // Each style (hover, active) may be set only once per element.
+    match (state, palette) {
+        (ButtonState::Disabled, _) => base.text_color(theme::muted()).cursor_default(),
+        (ButtonState::Enabled | ButtonState::Active, Palette::Primary) => base
+            .bg(theme::accent())
+            .text_color(theme::crust())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::text()).text_color(theme::crust()))
+            .active(|style| style.bg(theme::crust()))
+            .on_click(on_click),
+        (ButtonState::Enabled, Palette::Normal) => base
             .bg(theme::surface())
             .text_color(theme::subtext())
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_bright()).text_color(theme::text()))
             .active(|style| style.bg(theme::crust()))
             .on_click(on_click),
-        ButtonState::Active => base
+        (ButtonState::Active, Palette::Normal) => base
             .bg(theme::active_bg())
             .border_color(theme::accent())
             .text_color(theme::accent())

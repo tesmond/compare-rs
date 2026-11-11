@@ -73,19 +73,7 @@ pub struct GitFile {
 impl GitFile {
     /// Reads the history of the file at `path`.
     pub fn open(path: &Path) -> Result<Self, GitError> {
-        let path = fs::canonicalize(path)?;
-        let folder = path.parent().unwrap_or(Path::new("/"));
-        let root = git(folder, &["rev-parse", "--show-toplevel"])
-            .map_err(|error| match error {
-                GitError::Command(_) => GitError::NotInRepository(path.clone()),
-                other => other,
-            })
-            .map(|out| PathBuf::from(String::from_utf8_lossy(&out).trim()))?;
-        let root = fs::canonicalize(root)?;
-        let relative = path
-            .strip_prefix(&root)
-            .map_err(|_| GitError::NotInRepository(path.clone()))?
-            .to_path_buf();
+        let Located { root, path, relative } = locate(path)?;
         let relative_arg = relative.to_string_lossy().into_owned();
 
         let status = git(&root, &["status", "--porcelain=v1", "--", &relative_arg])?;
@@ -265,6 +253,106 @@ fn parse_blame(output: &str) -> Vec<BlameLine> {
 }
 
 /// Runs `git` in `folder` and returns its output.
+/// A file inside a repository.
+struct Located {
+    /// The repository's top folder.
+    root: PathBuf,
+    /// The file, with symlinks resolved.
+    path: PathBuf,
+    /// The file relative to `root`.
+    relative: PathBuf,
+}
+
+fn locate(path: &Path) -> Result<Located, GitError> {
+    let path = fs::canonicalize(path)?;
+    let folder = path.parent().unwrap_or(Path::new("/"));
+    let root = git(folder, &["rev-parse", "--show-toplevel"])
+        .map_err(|error| match error {
+            GitError::Command(_) => GitError::NotInRepository(path.clone()),
+            other => other,
+        })
+        .map(|out| PathBuf::from(String::from_utf8_lossy(&out).trim()))?;
+    let root = fs::canonicalize(root)?;
+    let relative = path
+        .strip_prefix(&root)
+        .map_err(|_| GitError::NotInRepository(path.clone()))?
+        .to_path_buf();
+    Ok(Located { root, path, relative })
+}
+
+/// The versions git keeps of a file with an unresolved merge conflict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictStages {
+    /// The file on disk, which holds the conflict markers.
+    pub path: PathBuf,
+    /// The common ancestor (stage 1); `None` if both sides added the file.
+    pub base: Option<Vec<u8>>,
+    /// The checked-out side (stage 2); `None` if it deleted the file.
+    pub ours: Option<Vec<u8>>,
+    /// The side being merged in (stage 3); `None` if it deleted the file.
+    pub theirs: Option<Vec<u8>>,
+    /// Short hash of `HEAD`.
+    pub ours_commit: Option<String>,
+    /// The operation's ref (`MERGE_HEAD`, `REBASE_HEAD`, ...) and its short
+    /// hash, if one is in progress.
+    pub theirs_commit: Option<(&'static str, String)>,
+}
+
+/// Refs naming the incoming commit of an operation that can stop with
+/// conflicts.
+const INCOMING_REFS: [&str; 4] = ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"];
+
+/// Returns true if `path` has an unresolved merge conflict. Errors (for
+/// example a file outside any repository) count as no conflict.
+pub fn has_conflict(path: &Path) -> bool {
+    unmerged_entries(path).is_ok_and(|(_, entries)| !entries.is_empty())
+}
+
+/// Reads the stages of `path`'s merge conflict, or `None` if it has no
+/// unresolved conflict.
+pub fn conflict_stages(path: &Path) -> Result<Option<ConflictStages>, GitError> {
+    let (located, entries) = unmerged_entries(path)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let root = &located.root;
+    let mut stages: [Option<Vec<u8>>; 3] = Default::default();
+    for (stage, object) in entries {
+        if let Some(slot) = stage.checked_sub(1).and_then(|i| stages.get_mut(i)) {
+            *slot = Some(git(root, &["cat-file", "blob", &object])?);
+        }
+    }
+    let short = |name: &str| {
+        git(root, &["rev-parse", "-q", "--verify", "--short", name])
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+            .filter(|hash| !hash.is_empty())
+    };
+    let ours_commit = short("HEAD");
+    let theirs_commit = INCOMING_REFS.iter().find_map(|&name| short(name).map(|hash| (name, hash)));
+    let [base, ours, theirs] = stages;
+    Ok(Some(ConflictStages { path: located.path, base, ours, theirs, ours_commit, theirs_commit }))
+}
+
+/// The file's index entries in a conflict stage, as (stage, object id).
+fn unmerged_entries(path: &Path) -> Result<(Located, Vec<(usize, String)>), GitError> {
+    let located = locate(path)?;
+    let relative = located.relative.to_string_lossy().into_owned();
+    let output = git(&located.root, &["ls-files", "-u", "-z", "--", &relative])?;
+    // Each record is "<mode> <object> <stage>\t<path>".
+    let entries = output
+        .split(|&byte| byte == 0)
+        .filter_map(|record| {
+            let record = String::from_utf8_lossy(record);
+            let (info, _) = record.split_once('\t')?;
+            let mut fields = info.split(' ');
+            let (_mode, object, stage) = (fields.next()?, fields.next()?, fields.next()?);
+            Some((stage.parse().ok()?, object.to_owned()))
+        })
+        .collect();
+    Ok((located, entries))
+}
+
 fn git(folder: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     let output = Command::new("git")
         .arg("-C")
@@ -313,6 +401,46 @@ mod tests {
                 FileVersion::Empty => "empty".to_owned(),
             })
             .collect()
+    }
+
+    /// A repository where merging branch `other` conflicts in `a.txt`.
+    fn conflicted_repo() -> tempfile::TempDir {
+        let dir = repo();
+        commit(dir.path(), "a.txt", "one\ntwo\nthree\n", "base");
+        run(dir.path(), &["checkout", "-q", "-b", "other"]);
+        commit(dir.path(), "a.txt", "one\nTHEIRS\nthree\n", "theirs");
+        run(dir.path(), &["checkout", "-q", "-"]);
+        commit(dir.path(), "a.txt", "one\nOURS\nthree\n", "ours");
+        // The merge stops with a conflict, which git reports as failure.
+        assert!(git(dir.path(), &["merge", "-q", "other"]).is_err());
+        dir
+    }
+
+    #[test]
+    fn reads_the_stages_of_a_conflicted_file() {
+        let dir = conflicted_repo();
+        let path = dir.path().join("a.txt");
+        assert!(has_conflict(&path));
+        let stages = conflict_stages(&path).expect("stages").expect("conflict");
+        assert_eq!(stages.base.as_deref(), Some(&b"one\ntwo\nthree\n"[..]));
+        assert_eq!(stages.ours.as_deref(), Some(&b"one\nOURS\nthree\n"[..]));
+        assert_eq!(stages.theirs.as_deref(), Some(&b"one\nTHEIRS\nthree\n"[..]));
+        assert!(stages.ours_commit.is_some());
+        assert_eq!(stages.theirs_commit.as_ref().map(|(name, _)| *name), Some("MERGE_HEAD"));
+    }
+
+    #[test]
+    fn resolved_and_clean_files_have_no_conflict() {
+        let dir = conflicted_repo();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "resolved\n").expect("write");
+        run(dir.path(), &["add", "a.txt"]);
+        assert!(!has_conflict(&path));
+        assert_eq!(conflict_stages(&path).expect("stages"), None);
+        let outside = tempfile::tempdir().expect("temp dir");
+        let loose = outside.path().join("loose.txt");
+        fs::write(&loose, "x").expect("write");
+        assert!(!has_conflict(&loose));
     }
 
     #[test]

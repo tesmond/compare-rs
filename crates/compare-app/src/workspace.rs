@@ -30,7 +30,7 @@ use crate::document_syntax::DocumentSyntax;
 use crate::folder_diff_view::{FolderDiffView, OpenFilePair};
 use crate::format;
 use crate::hex_diff_view::HexDiffView;
-use crate::merge_view::MergeView;
+use crate::merge_view::{GitConflict, MergeView};
 use crate::session_state::{self, SavedBounds, SavedTab, SessionState};
 use crate::tab::{Side, Tab, TabContent, TabKind};
 use crate::text_diff_view::{TextDiffEvent, TextDiffView};
@@ -75,6 +75,8 @@ enum CompareOutcome {
         infos: [FileInfo; 3],
         syntax: [DocumentSyntax; 3],
         document: MergeDocument,
+        /// Set when the inputs are a git conflict's stages.
+        conflict: Option<Box<GitConflict>>,
     },
     Failed(String),
 }
@@ -446,13 +448,17 @@ impl Workspace {
         tab.generation += 1;
         tab.subscription = None;
         let (tab_id, generation, kind) = (tab.id, tab.generation, tab.kind);
-        if kind == TabKind::History {
+        if matches!(kind, TabKind::History | TabKind::Conflict) {
             let Some(file) = tab.right.clone() else {
                 return;
             };
             tab.content = TabContent::Loading { progress: None };
-            let task =
-                cx.background_executor().spawn(async move { git_history(&file, &options.diff) });
+            let task = cx.background_executor().spawn(async move {
+                match kind {
+                    TabKind::Conflict => merge_git_conflict(&file, &options.diff),
+                    _ => git_history(&file, &options.diff),
+                }
+            });
             cx.spawn(async move |this, cx| {
                 let outcome = task.await;
                 this.update(cx, |this, cx| this.finish_compare(tab_id, generation, outcome, cx))
@@ -472,7 +478,9 @@ impl Workspace {
             (TabKind::Merge, Some(base)) => {
                 Box::new(move || merge_files(&left, &base, &right, &options.diff))
             }
-            (TabKind::Merge, None) | (TabKind::Text | TabKind::History, _) => return,
+            (TabKind::Merge, None) | (TabKind::Text | TabKind::History | TabKind::Conflict, _) => {
+                return;
+            }
             (TabKind::Compare, _) => match (TargetKind::of(&left), TargetKind::of(&right)) {
                 (TargetKind::File, TargetKind::File) => {
                     Box::new(move || compare_file_pair(&left, &right, &options))
@@ -636,11 +644,13 @@ impl Workspace {
                 self.tabs[index].subscription = Some(self.subscribe_to_text_view(&view, cx));
                 TabContent::Text(view)
             }
-            CompareOutcome::Merge { infos, syntax, document } => {
+            CompareOutcome::Merge { infos, syntax, document, conflict } => {
                 let wrap = self.wrap;
-                TabContent::Merge(
-                    cx.new(|cx| MergeView::new(infos, syntax, document, cx).with_wrap(wrap)),
-                )
+                TabContent::Merge(cx.new(|cx| {
+                    MergeView::new(infos, syntax, document, cx)
+                        .with_wrap(wrap)
+                        .with_git_conflict(conflict.map(|conflict| *conflict))
+                }))
             }
             CompareOutcome::Failed(message) => {
                 crash_log::record_error("Comparison failed", &message);
@@ -891,22 +901,70 @@ impl Workspace {
     /// Reformats JSON, Python dicts, and `\n` escapes on both sides of the
     /// active comparison, as an edit that can be undone.
     /// Asks for a file and opens its git history in a new tab.
-    fn on_open_git_history(&mut self, _: &OpenGitHistory, _: &mut Window, cx: &mut Context<Self>) {
+    /// Asks for a file and shows its git history. A file with an
+    /// unresolved merge conflict can be opened in the three-way merge
+    /// editor instead.
+    fn on_open_git_history(
+        &mut self,
+        _: &OpenGitHistory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some("Show History".into()),
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = receiver.await else {
                 return;
             };
-            if let Some(path) = paths.into_iter().next() {
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let conflicted = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    async move { compare_core::has_conflict(&path) }
+                })
+                .await;
+            if !conflicted {
                 this.update(cx, |this, cx| this.open_git_history(path, cx)).ok();
+                return;
             }
+            let name = format::file_name(&path);
+            let Ok(answer) = cx.update(|window, cx| {
+                window.prompt(
+                    PromptLevel::Info,
+                    &format!("{name} has an unresolved merge conflict"),
+                    Some(
+                        "Resolve it in the three-way merge editor, with the base, your \
+                         version and the incoming version loaded from git?",
+                    ),
+                    &["Open Three-Way Merge", "Show History", "Cancel"],
+                    cx,
+                )
+            }) else {
+                return;
+            };
+            match answer.await {
+                Ok(0) => this.update(cx, |this, cx| this.open_git_conflict(path, cx)).ok(),
+                Ok(1) => this.update(cx, |this, cx| this.open_git_history(path, cx)).ok(),
+                _ => None,
+            };
         })
         .detach();
+    }
+
+    /// Opens the merge editor on the conflict stages git keeps for `path`.
+    pub fn open_git_conflict(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let id = self.add_tab(TabKind::Conflict, cx);
+        if let Some(index) = self.tab_index(id) {
+            self.tabs[index].right = Some(path);
+            self.start_compare(index, cx);
+        }
     }
 
     /// Opens the git history of `path` in a new tab: the file on the right,
@@ -1305,9 +1363,9 @@ impl Workspace {
             .children(slots)
     }
 
-    fn render_content(&self) -> gpui::AnyElement {
+    fn render_content(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(tab) = self.active_tab() else {
-            return render_welcome().into_any_element();
+            return self.render_welcome(cx).into_any_element();
         };
         match &tab.content {
             TabContent::Empty => render_empty_tab(tab).into_any_element(),
@@ -1454,7 +1512,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(self.render_content()),
+                    .child(self.render_content(cx)),
             )
             .child(self.render_status_bar(cx))
     }
@@ -1533,6 +1591,7 @@ fn merge_files(left: &Path, base: &Path, right: &Path, options: &DiffOptions) ->
     };
     match (read(left), read(base), read(right)) {
         (Ok(l), Ok(b), Ok(r)) => CompareOutcome::Merge {
+            conflict: None,
             infos: [
                 FileInfo::from_path(left),
                 FileInfo::from_path(base),
@@ -1546,6 +1605,58 @@ fn merge_files(left: &Path, base: &Path, right: &Path, options: &DiffOptions) ->
             document: MergeDocument::new(l, b, r, options),
         },
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => CompareOutcome::Failed(e),
+    }
+}
+
+/// Loads the stages of `path`'s git merge conflict: ours on the left,
+/// the common ancestor as the base, and the incoming side on the right.
+fn merge_git_conflict(path: &Path, options: &DiffOptions) -> CompareOutcome {
+    let stages = match compare_core::conflict_stages(path) {
+        Ok(Some(stages)) => stages,
+        Ok(None) => {
+            return CompareOutcome::Failed(format!(
+                "{} no longer has an unresolved merge conflict",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            return CompareOutcome::Failed(format!("Could not read the merge conflict: {error}"));
+        }
+    };
+    let name = format::file_name(&stages.path);
+    let label = |side: &str, commit: Option<String>, contents: &Option<Vec<u8>>| {
+        let commit = commit.map(|commit| format!(" · {commit}")).unwrap_or_default();
+        let missing = if contents.is_none() { " (deleted)" } else { "" };
+        format!("{side}: {name}{commit}{missing}")
+    };
+    let titles = [
+        label("Ours", stages.ours_commit.map(|hash| format!("HEAD {hash}")), &stages.ours),
+        label("Base", None, &stages.base),
+        label(
+            "Theirs",
+            stages.theirs_commit.map(|(name, hash)| format!("{name} {hash}")),
+            &stages.theirs,
+        ),
+    ];
+    let documents = [&stages.ours, &stages.base, &stages.theirs]
+        .map(|bytes| TextDocument::decode(bytes.as_deref().unwrap_or_default()));
+    let info = |document: &TextDocument| FileInfo {
+        path: stages.path.clone(),
+        size: document.text().len() as u64,
+        modified: None,
+    };
+    let infos = [info(&documents[0]), info(&documents[1]), info(&documents[2])];
+    let syntax = [
+        DocumentSyntax::new(&stages.path, &documents[0]),
+        DocumentSyntax::new(&stages.path, &documents[1]),
+        DocumentSyntax::new(&stages.path, &documents[2]),
+    ];
+    let [ours, base, theirs] = documents;
+    CompareOutcome::Merge {
+        infos,
+        syntax,
+        document: MergeDocument::new(ours, base, theirs, options),
+        conflict: Some(Box::new(GitConflict { path: stages.path, titles })),
     }
 }
 
@@ -1566,8 +1677,14 @@ fn capitalize(word: &str) -> String {
     chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
 }
 
-fn shortcut_hint(keys: &'static str, label: &'static str) -> Div {
+/// A welcome-page button showing a command and its shortcut.
+fn shortcut_hint(
+    keys: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
+        .id(SharedString::from(format!("welcome-{label}")))
         .flex()
         .gap_2()
         .px_3()
@@ -1575,40 +1692,94 @@ fn shortcut_hint(keys: &'static str, label: &'static str) -> Div {
         .rounded(px(4.0))
         .bg(theme::surface())
         .text_size(theme::ui_text_size())
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::surface_bright()))
+        .active(|style| style.bg(theme::crust()))
+        .on_click(on_click)
         .child(div().text_color(theme::accent()).child(keys))
         .child(div().text_color(theme::subtext()).child(label))
 }
 
-fn render_welcome() -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .size_full()
-        .items_center()
-        .justify_center()
-        .gap_4()
-        .child(div().text_size(px(32.0)).font_weight(gpui::FontWeight::BOLD).child("compare-rs"))
-        .child(
-            div()
-                .text_size(px(14.0))
-                .text_color(theme::muted())
-                .child("Drop two files or folders here, or open them with the toolbar"),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .justify_center()
-                .gap_2()
-                .child(shortcut_hint("⌘O", "left file"))
-                .child(shortcut_hint("⇧⌘O", "right file"))
-                .child(shortcut_hint("⇧⌘E", "left folder"))
-                .child(shortcut_hint("⇧⌘R", "right folder"))
-                .child(shortcut_hint("⇧⌘M", "three-way merge"))
-                .child(shortcut_hint("⌥⌘G", "git history"))
-                .child(shortcut_hint("⌘T", "new tab")),
-        )
+impl Workspace {
+    /// The page shown when no tab is open. Each shortcut hint is also a
+    /// button that runs its command. The handlers are called directly
+    /// rather than dispatched as actions, so they work before anything in
+    /// the window has keyboard focus.
+    fn render_welcome(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .child(
+                div().text_size(px(32.0)).font_weight(gpui::FontWeight::BOLD).child("compare-rs"),
+            )
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(theme::muted())
+                    .child("Drop two files or folders here, or open them with the toolbar"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_2()
+                    .child(shortcut_hint(
+                        "⌘O",
+                        "left file",
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.on_open_left(&OpenLeft, window, cx)
+                        }),
+                    ))
+                    .child(shortcut_hint(
+                        "⇧⌘O",
+                        "right file",
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.on_open_right(&OpenRight, window, cx)
+                        }),
+                    ))
+                    .child(shortcut_hint(
+                        "⇧⌘E",
+                        "left folder",
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.on_open_folder_left(&OpenFolderLeft, window, cx)
+                        }),
+                    ))
+                    .child(shortcut_hint(
+                        "⇧⌘R",
+                        "right folder",
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.on_open_folder_right(&OpenFolderRight, window, cx)
+                        }),
+                    ))
+                    .child(shortcut_hint(
+                        "⇧⌘M",
+                        "three-way merge",
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.on_merge(&Merge, window, cx)
+                        }),
+                    ))
+                    .child(shortcut_hint(
+                        "⌥⌘G",
+                        "git history",
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.on_open_git_history(&OpenGitHistory, window, cx)
+                        }),
+                    ))
+                    .child(shortcut_hint(
+                        "⌘T",
+                        "new tab",
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.on_new_tab(&NewTab, window, cx)
+                        }),
+                    )),
+            )
+    }
 }
 
 fn render_empty_tab(tab: &Tab) -> Div {
@@ -1660,4 +1831,55 @@ fn centered_message(message: SharedString, color: Hsla) -> Div {
         .text_size(px(14.0))
         .text_color(color)
         .child(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .expect("run git")
+            .status
+            .success()
+    }
+
+    #[test]
+    fn git_conflict_loads_ours_base_and_theirs_into_the_merge() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path();
+        let file = repo.join("a.txt");
+        assert!(git(repo, &["init", "-q"]));
+        std::fs::write(&file, "one\ntwo\nthree\n").expect("write");
+        assert!(git(repo, &["add", "a.txt"]) && git(repo, &["commit", "-qm", "base"]));
+        assert!(git(repo, &["checkout", "-qb", "other"]));
+        std::fs::write(&file, "one\nTHEIRS\nthree\n").expect("write");
+        assert!(git(repo, &["commit", "-qam", "theirs"]));
+        assert!(git(repo, &["checkout", "-q", "-"]));
+        std::fs::write(&file, "one\nOURS\nthree\n").expect("write");
+        assert!(git(repo, &["commit", "-qam", "ours"]));
+        assert!(!git(repo, &["merge", "-q", "other"]), "merge should conflict");
+
+        let CompareOutcome::Merge { document, conflict, .. } =
+            merge_git_conflict(&file, &DiffOptions::default())
+        else {
+            panic!("expected a merge");
+        };
+        assert_eq!(document.left.text(), "one\nOURS\nthree\n");
+        assert_eq!(document.base.text(), "one\ntwo\nthree\n");
+        assert_eq!(document.right.text(), "one\nTHEIRS\nthree\n");
+        assert_eq!(document.conflicts.len(), 1);
+        let conflict = conflict.expect("conflict source");
+        assert!(conflict.titles[0].starts_with("Ours: a.txt · HEAD "));
+        assert_eq!(conflict.titles[1], "Base: a.txt");
+        assert!(conflict.titles[2].starts_with("Theirs: a.txt · MERGE_HEAD "));
+    }
 }

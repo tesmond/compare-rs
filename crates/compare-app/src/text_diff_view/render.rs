@@ -380,6 +380,9 @@ impl TextDiffView {
             .map(|range| Mark::background(range.clone(), style.emphasis_color))
             .collect();
 
+        // The current match is drawn last, over the selection, so it stays
+        // clearly visible after a find selects it.
+        let mut current_mark = None;
         if let Some(find) = &self.find {
             let current = find.current_match();
             for found in find.matches_on_line(side, line) {
@@ -387,16 +390,21 @@ impl TextDiffView {
                 let end = if found.end.line == line { found.end.column } else { text.len() };
                 let range =
                     format::to_display_offset(text, start)..format::to_display_offset(text, end);
-                let is_current = current.is_some_and(|(s, m)| s == side && m == found);
-                marks.push(Mark {
-                    range,
-                    background: Some(if is_current {
-                        theme::find_current()
-                    } else {
-                        theme::find_match()
-                    }),
-                    underline: Some(theme::yellow()),
-                });
+                if current.is_some_and(|(s, m)| s == side && m == found) {
+                    current_mark = Some(Mark {
+                        range,
+                        background: Some(theme::find_current()),
+                        underline: None,
+                        foreground: Some(theme::find_current_text()),
+                    });
+                } else {
+                    marks.push(Mark {
+                        range,
+                        background: Some(theme::find_match()),
+                        underline: Some(theme::yellow()),
+                        foreground: Some(theme::find_match_text()),
+                    });
+                }
             }
         }
 
@@ -419,6 +427,7 @@ impl TextDiffView {
             let color = if is_active { theme::selection() } else { theme::selection_inactive() };
             marks.push(Mark::background(start..end, color));
         }
+        marks.extend(current_mark);
 
         let head = state.selection.head;
         let has_cursor = is_active && head.line == line;

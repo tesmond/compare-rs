@@ -34,7 +34,10 @@ pub use folder_comparison::{
     EntryKind, EntryMeta, FolderComparison, FolderNode, FolderProgress, FolderStats, FolderStatus,
     compare_folders,
 };
-pub use git_history::{BlameLine, Commit, FileVersion, GitError, GitFile};
+pub use git_history::{
+    BlameLine, Commit, ConflictStages, FileVersion, GitError, GitFile, conflict_stages,
+    has_conflict,
+};
 pub use live_diff::{DiffSide, LiveDiff, RowSplice};
 pub use merge_document::{MergeDocument, MergeRow, OutputLine, Resolution};
 pub use text_diff::{AlignedRow, RowKind, TextDiff};

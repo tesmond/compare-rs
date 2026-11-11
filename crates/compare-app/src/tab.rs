@@ -21,6 +21,9 @@ pub enum TabKind {
     Text,
     /// Browses one file's git history; `right` holds the file.
     History,
+    /// Resolves a file's unresolved git merge conflict from the stages git
+    /// keeps; `right` holds the file.
+    Conflict,
 }
 
 /// One input slot of a tab.
@@ -109,7 +112,7 @@ impl Tab {
         match self.kind {
             TabKind::Compare => &[Side::Left, Side::Right],
             TabKind::Merge => &[Side::Left, Side::Base, Side::Right],
-            TabKind::Text | TabKind::History => &[],
+            TabKind::Text | TabKind::History | TabKind::Conflict => &[],
         }
     }
 
@@ -133,6 +136,10 @@ impl Tab {
         if self.kind == TabKind::History {
             let file = name(self.right.as_deref()).unwrap_or_else(|| "File".to_owned());
             return format!("{file} · history");
+        }
+        if self.kind == TabKind::Conflict {
+            let file = name(self.right.as_deref()).unwrap_or_else(|| "File".to_owned());
+            return format!("Merge: {file} · conflict");
         }
         let prefix = if self.kind == TabKind::Merge { "Merge: " } else { "" };
         match (name(self.left.as_deref()), name(self.right.as_deref())) {
