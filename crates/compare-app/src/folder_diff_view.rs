@@ -79,6 +79,11 @@ pub struct FolderDiffView {
     ascending: bool,
     differences_only: bool,
     scroll: UniformListScrollHandle,
+    /// What each side is called in its header.
+    captions: [&'static str; 2],
+    /// False when the entries are not files on disk (git branches), so
+    /// there are no paths to copy or reveal.
+    on_disk: bool,
 }
 
 impl EventEmitter<OpenFilePair> for FolderDiffView {}
@@ -121,9 +126,19 @@ impl FolderDiffView {
             ascending: true,
             differences_only: false,
             scroll: UniformListScrollHandle::new(),
+            captions: ["Left folder", "Right folder"],
+            on_disk: true,
         };
         view.rebuild_visible();
         view
+    }
+
+    /// Marks the comparison as one of two git branches rather than folders:
+    /// the entries have no paths on disk until they are opened.
+    pub fn for_git_branches(mut self) -> Self {
+        self.captions = ["Left branch", "Right branch"];
+        self.on_disk = false;
+        self
     }
 
     /// Re-checks the file pair that includes `path` after it was saved.
@@ -150,6 +165,9 @@ impl FolderDiffView {
 
     /// Paths of the selected entry on each side, for copying.
     pub fn selected_paths(&self) -> Vec<PathBuf> {
+        if !self.on_disk {
+            return Vec::new();
+        }
         let Some(node) = self.selected.map(|index| &self.comparison.nodes[index]) else {
             return vec![self.comparison.left_root.clone(), self.comparison.right_root.clone()];
         };
@@ -398,13 +416,16 @@ impl FolderDiffView {
         Some(MenuTarget {
             is_dir: node.is_dir(),
             is_file_pair: node.is_file_pair(),
-            has_left: node.left.is_some(),
-            has_right: node.right.is_some(),
+            has_left: self.on_disk && node.left.is_some(),
+            has_right: self.on_disk && node.right.is_some(),
         })
     }
 
     /// Path of the selected entry on one side, if it exists there.
     fn selected_side_path(&self, left: bool) -> Option<PathBuf> {
+        if !self.on_disk {
+            return None;
+        }
         let node = &self.comparison.nodes[self.selected?];
         match left {
             true => node.left.map(|_| self.comparison.left_path(node)),
@@ -718,9 +739,9 @@ impl Render for FolderDiffView {
                 div()
                     .flex()
                     .flex_row()
-                    .child(file_header::header_bar(self.left_label.clone(), "Left folder"))
+                    .child(file_header::header_bar(self.left_label.clone(), self.captions[0]))
                     .child(div().w(px(1.0)).bg(theme::surface()))
-                    .child(file_header::header_bar(self.right_label.clone(), "Right folder")),
+                    .child(file_header::header_bar(self.right_label.clone(), self.captions[1])),
             )
             .child(
                 div()

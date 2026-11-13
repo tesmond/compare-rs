@@ -6,6 +6,7 @@
 mod actions;
 mod app_assets;
 mod app_dirs;
+mod branch_compare_view;
 mod button;
 mod code_text;
 mod crash_log;
@@ -32,9 +33,10 @@ use gpui::{
 };
 
 use crate::actions::{
-    Beautify, CloseTab, Compare, CopyPaths, Merge, NewTab, NewTextCompare, NextDifference, NextTab,
-    OpenFolderLeft, OpenFolderRight, OpenGitHistory, OpenLeft, OpenRight, PrevDifference, PrevTab,
-    Quit, RevertFile, SaveAll, SaveFile, ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
+    Beautify, CloseTab, Compare, CompareBranches, CopyPaths, Merge, NewTab, NewTextCompare,
+    NextDifference, NextTab, OpenFolderLeft, OpenFolderRight, OpenGitHistory, OpenLeft, OpenRight,
+    PrevDifference, PrevTab, Quit, RevertFile, SaveAll, SaveFile, ToggleIgnoreCase,
+    ToggleIgnoreWhitespace, ToggleWordWrap,
 };
 use crate::actions::{
     Copy, CopyBlockToLeft, CopyBlockToRight, CopyLineToLeft, CopyLineToRight, Cut, FindNext,
@@ -168,6 +170,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("New Tab", NewTab),
                 MenuItem::action("New Text Compare", NewTextCompare),
                 MenuItem::action("Open Git History…", OpenGitHistory),
+                MenuItem::action("Compare Git Branches…", CompareBranches),
                 MenuItem::separator(),
                 MenuItem::action("Open Left File…", OpenLeft),
                 MenuItem::action("Open Right File…", OpenRight),

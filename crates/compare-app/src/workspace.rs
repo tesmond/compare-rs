@@ -18,13 +18,14 @@ use compare_core::{
 };
 
 use crate::actions::{
-    Beautify, CloseTab, Compare, CompareFolders, CopyPaths, FindNext, FindPrev, Merge, NewTab,
-    NewTextCompare, NextDifference, NextTab, OpenFind, OpenFolderLeft, OpenFolderRight,
-    OpenGitHistory, OpenLeft, OpenReplace, OpenRight, PrevDifference, PrevTab, Quit, ReplaceAll,
-    ReplaceNext, RevertFile, SaveAll, SaveFile, ToggleIgnoreCase, ToggleIgnoreWhitespace,
-    ToggleWordWrap,
+    Beautify, CloseTab, Compare, CompareBranches, CompareFolders, CopyPaths, FindNext, FindPrev,
+    Merge, NewTab, NewTextCompare, NextDifference, NextTab, OpenFind, OpenFolderLeft,
+    OpenFolderRight, OpenGitHistory, OpenLeft, OpenReplace, OpenRight, PrevDifference, PrevTab,
+    Quit, ReplaceAll, ReplaceNext, RevertFile, SaveAll, SaveFile, ToggleIgnoreCase,
+    ToggleIgnoreWhitespace, ToggleWordWrap,
 };
 use crate::app_assets;
+use crate::branch_compare_view::BranchCompareView;
 use crate::button::{self, ButtonState, Content, Segment};
 use crate::crash_log;
 use crate::document_syntax::DocumentSyntax;
@@ -580,7 +581,8 @@ impl Workspace {
             (TabKind::Merge, Some(base)) => {
                 Box::new(move || merge_files(&left, &base, &right, &options.diff))
             }
-            (TabKind::Merge, None) | (TabKind::Text | TabKind::History | TabKind::Conflict, _) => {
+            (TabKind::Merge, None)
+            | (TabKind::Text | TabKind::History | TabKind::Conflict | TabKind::Branches, _) => {
                 return;
             }
             (TabKind::Compare, _) => match (TargetKind::of(&left), TargetKind::of(&right)) {
@@ -676,10 +678,8 @@ impl Workspace {
                             self.tabs[index]
                                 .targets
                                 .iter()
-                                .any(|target| {
-                                    target.is_extracted() && path.starts_with(target.folder())
-                                })
-                                .then_some("Read-only: inside an archive")
+                                .filter(|target| path.starts_with(target.folder()))
+                                .find_map(|target| target.read_only_reason())
                         };
                         let read_only = [in_archive(&left.path), in_archive(&right.path)];
                         let view = cx.new(|cx| {
@@ -780,9 +780,16 @@ impl Workspace {
     }
 
     /// Opens paths given on the command line: two paths are compared, three
-    /// are merged as `LEFT BASE RIGHT`, and `--history FILE` opens the
-    /// file's git history.
+    /// are merged as `LEFT BASE RIGHT`, `--history FILE` opens the file's
+    /// git history, and `--branches FOLDER` compares branches of the
+    /// repository holding the folder.
     pub fn open_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if let [flag, folder] = paths.as_slice()
+            && flag.as_os_str() == "--branches"
+        {
+            self.open_branch_compare(folder.clone(), cx);
+            return;
+        }
         if let [flag, file] = paths.as_slice()
             && flag.as_os_str() == "--history"
         {
@@ -906,12 +913,17 @@ impl Workspace {
             Some(TabContent::Binary(view)) => view.read(cx).has_differences(),
             Some(TabContent::Folder(view)) => view.read(cx).has_differences(),
             Some(TabContent::Merge(view)) => view.read(cx).has_differences(),
+            Some(TabContent::Branches(view)) => view.read(cx).has_differences(cx),
             _ => false,
         }
     }
 
     fn compare_active(&mut self, cx: &mut Context<Self>) {
         if self.compare_blocked(cx).is_some() {
+            return;
+        }
+        if let Some(TabContent::Branches(view)) = self.active_tab().map(|tab| &tab.content) {
+            view.clone().update(cx, |view, cx| view.compare(cx));
             return;
         }
         if let Some(tab) = self.active_tab() {
@@ -987,6 +999,9 @@ impl Workspace {
                 if forward { view.next_difference(cx) } else { view.prev_difference(cx) }
             }),
             TabContent::Merge(view) => view.update(cx, |view, cx| {
+                if forward { view.next_difference(cx) } else { view.prev_difference(cx) }
+            }),
+            TabContent::Branches(view) => view.update(cx, |view, cx| {
                 if forward { view.next_difference(cx) } else { view.prev_difference(cx) }
             }),
             TabContent::Empty | TabContent::Loading { .. } | TabContent::Error(_) => {}
@@ -1083,6 +1098,76 @@ impl Workspace {
                 Ok(1) => this.update(cx, |this, cx| this.open_git_history(path, cx)).ok(),
                 _ => None,
             };
+        })
+        .detach();
+    }
+
+    /// Asks for a folder in a git repository and opens a tab for comparing
+    /// two of its branches.
+    fn on_compare_branches(&mut self, _: &CompareBranches, _: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose Repository".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            if let Some(path) = paths.into_iter().next() {
+                this.update(cx, |this, cx| this.open_branch_compare(path, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Opens a tab for comparing two branches of the repository holding
+    /// `path`.
+    pub fn open_branch_compare(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let id = self.add_tab(TabKind::Branches, cx);
+        if let Some(index) = self.tab_index(id) {
+            let tab = &mut self.tabs[index];
+            tab.right = Some(path.clone());
+            tab.content = TabContent::Loading { progress: None };
+        }
+        let task =
+            cx.background_executor().spawn(async move { compare_core::list_branches(&path) });
+        cx.spawn(async move |this, cx| {
+            let branches = task.await;
+            this.update(cx, |this, cx| {
+                let Some(index) = this.tab_index(id) else {
+                    return;
+                };
+                let content = match branches {
+                    Ok(branches) if branches.names.is_empty() => TabContent::Error(
+                        "This repository has no branches yet. Make a first commit, then try again."
+                            .into(),
+                    ),
+                    Ok(branches) => {
+                        this.tabs[index].right = Some(branches.root.clone());
+                        let view = cx.new(|cx| BranchCompareView::new(branches, cx));
+                        let subscription =
+                            cx.subscribe(&view, |this, view, event: &OpenFilePair, cx| {
+                                let targets = view.read(cx).targets();
+                                this.open_file_pair(
+                                    event.left.clone(),
+                                    event.right.clone(),
+                                    targets,
+                                    cx,
+                                );
+                            });
+                        this.tabs[index].subscription = Some(subscription);
+                        TabContent::Branches(view)
+                    }
+                    Err(error) => {
+                        TabContent::Error(format!("Could not list the branches: {error}").into())
+                    }
+                };
+                this.tabs[index].content = content;
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -1357,9 +1442,14 @@ impl Workspace {
             ))
             .child(button::separator())
             .child(open(
-                Content::AppIcon(app_assets::GIT_ICON),
+                Content::AppIcon(app_assets::GIT_HISTORY_ICON),
                 Box::new(OpenGitHistory),
                 "Open a file's git history",
+            ))
+            .child(open(
+                Content::AppIcon(app_assets::GIT_BRANCHES_ICON),
+                Box::new(CompareBranches),
+                "Compare two git branches",
             ));
         let actions = group()
             .child(button::primary_action_button(
@@ -1514,6 +1604,7 @@ impl Workspace {
             TabContent::Binary(view) => view.clone().into_any_element(),
             TabContent::Folder(view) => view.clone().into_any_element(),
             TabContent::Merge(view) => view.clone().into_any_element(),
+            TabContent::Branches(view) => view.clone().into_any_element(),
             TabContent::Error(message) => {
                 centered_message(message.clone(), theme::red()).into_any_element()
             }
@@ -1531,6 +1622,7 @@ impl Workspace {
             TabContent::Binary(view) => (view.read(cx).summary(), theme::subtext()),
             TabContent::Folder(view) => (view.read(cx).summary(), theme::subtext()),
             TabContent::Merge(view) => (view.read(cx).summary(), theme::subtext()),
+            TabContent::Branches(view) => (view.read(cx).summary(cx), theme::subtext()),
             TabContent::Error(message) => (message.to_string(), theme::red()),
         }
     }
@@ -1608,6 +1700,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_new_text_compare))
             .on_action(cx.listener(Self::on_beautify))
             .on_action(cx.listener(Self::on_open_git_history))
+            .on_action(cx.listener(Self::on_compare_branches))
             .on_action(cx.listener(Self::on_toggle_word_wrap))
             .on_action(cx.listener(Self::on_open_left))
             .on_action(cx.listener(Self::on_open_right))
@@ -1909,6 +2002,13 @@ impl Workspace {
                         "git history",
                         cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.on_open_git_history(&OpenGitHistory, window, cx)
+                        }),
+                    ))
+                    .child(shortcut_hint(
+                        "⌥⌘B",
+                        "git branches",
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.on_compare_branches(&CompareBranches, window, cx)
                         }),
                     ))
                     .child(shortcut_hint(

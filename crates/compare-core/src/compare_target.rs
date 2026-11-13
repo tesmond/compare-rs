@@ -38,7 +38,12 @@ impl TargetKind {
 pub struct CompareTarget {
     original: PathBuf,
     extracted: Option<TempDir>,
+    /// Why files in the temporary directory cannot be edited.
+    read_only_reason: &'static str,
 }
+
+/// Shown on files opened from an unpacked archive.
+const ARCHIVE_READ_ONLY: &str = "Read-only: inside an archive";
 
 impl CompareTarget {
     /// Prepares `path` for folder comparison, extracting it if it is an archive.
@@ -50,7 +55,30 @@ impl CompareTarget {
         } else {
             None
         };
-        Ok(Self { original: path.to_owned(), extracted })
+        Ok(Self { original: path.to_owned(), extracted, read_only_reason: ARCHIVE_READ_ONLY })
+    }
+
+    /// A temporary folder standing in for `original`, which is not a folder
+    /// on disk (for example a git branch). Files are copied into it as they
+    /// are opened, and are read-only for `read_only_reason`. `name` starts
+    /// the folder's name, so paths shown to the user are recognizable.
+    pub fn snapshot(
+        original: PathBuf,
+        name: &str,
+        read_only_reason: &'static str,
+    ) -> std::io::Result<Self> {
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+            .collect();
+        let dir = tempfile::Builder::new().prefix(&format!("{safe}-")).tempdir()?;
+        Ok(Self { original, extracted: Some(dir), read_only_reason })
+    }
+
+    /// Why a file under [`CompareTarget::folder`] cannot be edited, if this
+    /// target is a temporary copy.
+    pub fn read_only_reason(&self) -> Option<&'static str> {
+        self.extracted.as_ref().map(|_| self.read_only_reason)
     }
 
     /// Returns true if this is an archive unpacked into a temporary folder.

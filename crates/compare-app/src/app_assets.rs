@@ -4,8 +4,9 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString};
 
-/// Path of the git icon, for [`gpui_component::Icon::path`].
-pub const GIT_ICON: &str = "icons/git.svg";
+/// Paths of the Git compare icons, for [`gpui_component::Icon::path`].
+pub const GIT_HISTORY_ICON: &str = "icons/git-history.svg";
+pub const GIT_BRANCHES_ICON: &str = "icons/git-branches.svg";
 
 /// The app's own icons, plus the icon set of the UI component library.
 pub struct AppAssets;
@@ -13,15 +14,22 @@ pub struct AppAssets;
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         match path {
-            GIT_ICON => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/git.svg")))),
+            GIT_HISTORY_ICON => {
+                Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/git-history.svg"))))
+            }
+            GIT_BRANCHES_ICON => {
+                Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/git-branches.svg"))))
+            }
             _ => gpui_component_assets::Assets.load(path),
         }
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut paths = gpui_component_assets::Assets.list(path)?;
-        if GIT_ICON.starts_with(path) {
-            paths.push(GIT_ICON.into());
+        for icon in [GIT_HISTORY_ICON, GIT_BRANCHES_ICON] {
+            if icon.starts_with(path) {
+                paths.push(icon.into());
+            }
         }
         Ok(paths)
     }
@@ -33,9 +41,12 @@ mod tests {
 
     #[test]
     fn serves_app_and_library_icons() {
-        let git = AppAssets.load(GIT_ICON).expect("load").expect("present");
-        assert!(git.starts_with(b"<svg"));
+        let paths = AppAssets.list("icons/").expect("list");
+        for icon in [GIT_HISTORY_ICON, GIT_BRANCHES_ICON] {
+            let svg = AppAssets.load(icon).expect("load").expect("present");
+            assert!(svg.starts_with(b"<svg"));
+            assert!(paths.iter().any(|p| p == icon));
+        }
         assert!(AppAssets.load("icons/file.svg").expect("load").is_some());
-        assert!(AppAssets.list("icons/").expect("list").iter().any(|p| p == GIT_ICON));
     }
 }

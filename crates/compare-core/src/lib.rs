@@ -3,6 +3,7 @@
 //! - [`compare_files`] produces a text or binary comparison of two files.
 //! - [`compare_folders`] recursively compares two directory trees in parallel.
 //! - [`MergeDocument`] holds a three-way merge and its conflict resolutions.
+//! - [`compare_branches`] compares two git branches as if they were folders.
 //! - [`CompareTarget`] classifies paths and unpacks archives for comparison.
 //! - [`EditBuffer`], [`History`], and [`LiveDiff`] support editing a comparison.
 
@@ -15,6 +16,7 @@ mod edit_history;
 mod file_comparison;
 mod file_info;
 mod folder_comparison;
+mod git_branches;
 mod git_history;
 mod live_diff;
 mod merge_document;
@@ -34,6 +36,7 @@ pub use folder_comparison::{
     EntryKind, EntryMeta, FolderComparison, FolderNode, FolderProgress, FolderStats, FolderStatus,
     compare_folders,
 };
+pub use git_branches::{GitBranches, compare_branches, export_branch_file, list_branches};
 pub use git_history::{
     BlameLine, Commit, ConflictStages, FileVersion, GitError, GitFile, conflict_stages,
     has_conflict,

@@ -7,6 +7,7 @@ use gpui::{Entity, SharedString, Subscription};
 
 use compare_core::{CompareTarget, FolderProgress};
 
+use crate::branch_compare_view::BranchCompareView;
 use crate::folder_diff_view::FolderDiffView;
 use crate::hex_diff_view::HexDiffView;
 use crate::merge_view::MergeView;
@@ -24,6 +25,8 @@ pub enum TabKind {
     /// Resolves a file's unresolved git merge conflict from the stages git
     /// keeps; `right` holds the file.
     Conflict,
+    /// Compares two branches of a git repository; `right` holds its folder.
+    Branches,
 }
 
 /// One input slot of a tab.
@@ -56,6 +59,7 @@ pub enum TabContent {
     Binary(Entity<HexDiffView>),
     Folder(Entity<FolderDiffView>),
     Merge(Entity<MergeView>),
+    Branches(Entity<BranchCompareView>),
     Error(SharedString),
 }
 
@@ -112,7 +116,7 @@ impl Tab {
         match self.kind {
             TabKind::Compare => &[Side::Left, Side::Right],
             TabKind::Merge => &[Side::Left, Side::Base, Side::Right],
-            TabKind::Text | TabKind::History | TabKind::Conflict => &[],
+            TabKind::Text | TabKind::History | TabKind::Conflict | TabKind::Branches => &[],
         }
     }
 
@@ -136,6 +140,10 @@ impl Tab {
         if self.kind == TabKind::History {
             let file = name(self.right.as_deref()).unwrap_or_else(|| "File".to_owned());
             return format!("{file} · history");
+        }
+        if self.kind == TabKind::Branches {
+            let repository = name(self.right.as_deref()).unwrap_or_else(|| "Repository".to_owned());
+            return format!("{repository} · branches");
         }
         if self.kind == TabKind::Conflict {
             let file = name(self.right.as_deref()).unwrap_or_else(|| "File".to_owned());

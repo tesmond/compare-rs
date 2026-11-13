@@ -298,25 +298,35 @@ fn compare_folders_in_pool(
         return Err(io::Error::new(io::ErrorKind::Interrupted, "folder comparison cancelled"));
     }
 
+    Ok(comparison_from_pending(left.to_owned(), right.to_owned(), pending))
+}
+
+/// A node before it is flattened into the arena.
+pub(crate) struct PendingNode {
+    pub(crate) name: OsString,
+    pub(crate) relative_path: PathBuf,
+    pub(crate) left: Option<EntryMeta>,
+    pub(crate) right: Option<EntryMeta>,
+    pub(crate) status: FolderStatus,
+    pub(crate) children: Vec<PendingNode>,
+}
+
+/// Builds a comparison of `left_root` and `right_root` from nodes that
+/// have already been compared.
+pub(crate) fn comparison_from_pending(
+    left_root: PathBuf,
+    right_root: PathBuf,
+    pending: Vec<PendingNode>,
+) -> FolderComparison {
     let mut comparison = FolderComparison {
-        left_root: left.to_owned(),
-        right_root: right.to_owned(),
+        left_root,
+        right_root,
         nodes: Vec::new(),
         roots: Vec::new(),
         stats: FolderStats::default(),
     };
     comparison.roots = flatten(pending, 0, &mut comparison.nodes, &mut comparison.stats);
-    Ok(comparison)
-}
-
-/// A node before it is flattened into the arena.
-struct PendingNode {
-    name: OsString,
-    relative_path: PathBuf,
-    left: Option<EntryMeta>,
-    right: Option<EntryMeta>,
-    status: FolderStatus,
-    children: Vec<PendingNode>,
+    comparison
 }
 
 struct DirEntryInfo {

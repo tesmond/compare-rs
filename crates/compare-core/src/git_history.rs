@@ -353,7 +353,7 @@ fn unmerged_entries(path: &Path) -> Result<(Located, Vec<(usize, String)>), GitE
     Ok((located, entries))
 }
 
-fn git(folder: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
+pub(crate) fn git(folder: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(folder)
