@@ -60,17 +60,23 @@ impl HexDiffView {
         )
     }
 
+    /// Returns true if any bytes differ.
+    pub fn has_differences(&self) -> bool {
+        !self.diff.differing_rows.is_empty()
+    }
+
+    /// Moves to the next run of differing rows, wrapping to the first.
+    /// Stepping a row at a time would take hundreds of presses to get past
+    /// one long difference.
     pub fn next_difference(&mut self, cx: &mut Context<Self>) {
-        let count = self.diff.differing_rows.len();
-        if count > 0 {
-            let next = self.current.map_or(0, |current| (current + 1).min(count - 1));
+        if let Some(next) = self.diff.next_run(self.current) {
             self.go_to(next, cx);
         }
     }
 
+    /// Moves to the previous run of differing rows, wrapping to the last.
     pub fn prev_difference(&mut self, cx: &mut Context<Self>) {
-        if !self.diff.differing_rows.is_empty() {
-            let prev = self.current.map_or(0, |current| current.saturating_sub(1));
+        if let Some(prev) = self.diff.prev_run(self.current) {
             self.go_to(prev, cx);
         }
     }

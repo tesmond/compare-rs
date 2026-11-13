@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use gpui::{Context, EventEmitter, PromptLevel, Task, Window};
+use gpui::{Context, EventEmitter, PromptLevel, SharedString, Task, Window};
 
 use compare_core::{DiffSide, EditBuffer, FileInfo, LiveDiff, TextDocument};
 
@@ -165,7 +165,9 @@ impl TextDiffView {
         if state.path.as_ref() != Some(&path) {
             // Newly named text: highlight it for its file type.
             state.syntax = DocumentSyntax::from_lines(&path, state.buffer.lines());
+            self.row_cache.borrow_mut().clear();
         }
+        let state = self.side_mut(side);
         state.path = Some(path.clone());
         state.disk_modified = info.modified;
         state.info = info;
@@ -174,63 +176,161 @@ impl TextDiffView {
         cx.notify();
     }
 
-    /// Discards unsaved changes to the side with the cursor by reloading it.
-    pub fn revert_active(&mut self, cx: &mut Context<Self>) {
-        self.revert(self.active, cx);
+    /// Discards unsaved changes to the side with the cursor by reloading it,
+    /// after asking.
+    pub fn revert_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_revert(self.active, window, cx);
+    }
+
+    /// Reloads `side` from its file. Unsaved changes cannot be brought back
+    /// afterwards (the undo history is cleared), so this asks first when
+    /// there are any.
+    pub(super) fn request_revert(
+        &mut self,
+        side: DiffSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.side(side);
+        if state.path.is_none() {
+            return;
+        }
+        if !state.is_modified() {
+            self.revert(side, cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Revert {}?", state.display_name()),
+            Some("Your unsaved changes will be lost. This cannot be undone."),
+            &["Revert", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |this, cx| this.revert(side, cx)).ok();
+            }
+        })
+        .detach();
     }
 
     /// Reloads `side` from its file, discarding unsaved changes.
-    pub fn revert(&mut self, side: DiffSide, cx: &mut Context<Self>) {
+    fn revert(&mut self, side: DiffSide, cx: &mut Context<Self>) {
         let Some(path) = self.side(side).path.clone() else {
             return;
         };
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        let name = self.side(side).display_name();
+        let load = self.load_side(
+            side,
+            path.clone(),
+            move || std::fs::read(&path).map(|bytes| (bytes, FileInfo::from_path(&path))),
+            move |this, _| {
+                let state = this.side_mut(side);
+                state.disk_modified = state.info.modified;
+            },
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = load.await {
                 crash_log::record_error("Reverting a file", &error.to_string());
-                return;
+                this.update(cx, |this, cx| {
+                    this.notice = Some(format!("Could not reload {name}: {error}").into());
+                    cx.notify();
+                })
+                .ok();
             }
-        };
-        let document = TextDocument::decode(&bytes);
-        let info = FileInfo::from_path(&path);
-        self.replace_side(side, &document, &path, info, cx);
-        let state = self.side_mut(side);
-        state.disk_modified = state.info.modified;
-        cx.notify();
+        })
+        .detach();
     }
 }
 
+/// The replacement text of one side, prepared off the main thread.
+struct LoadedSide {
+    buffer: EditBuffer,
+    syntax: DocumentSyntax,
+    info: FileInfo,
+    read_only: Option<SharedString>,
+    /// The comparison with the other side as it was at `revision`.
+    diff: LiveDiff,
+    revision: u64,
+}
+
 impl TextDiffView {
-    /// Replaces the whole text of `side` with `document` (a reload, not an
-    /// edit: undo history is cleared) and re-diffs. `syntax_path` picks the
-    /// highlighting language.
-    pub(super) fn replace_side(
+    /// Replaces the whole text of `side` with what `read` returns (a
+    /// reload, not an edit: undo history is cleared) and re-diffs. Reading,
+    /// decoding, highlighting, and diffing run on a background thread, so a
+    /// large file does not freeze the window. `syntax_path` picks the
+    /// highlighting language; `after` runs once the text is in place.
+    pub(super) fn load_side<E: Send + 'static>(
         &mut self,
         side: DiffSide,
-        document: &TextDocument,
-        syntax_path: &Path,
-        info: FileInfo,
+        syntax_path: PathBuf,
+        read: impl FnOnce() -> Result<(Vec<u8>, FileInfo), E> + Send + 'static,
+        after: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Task<Result<(), E>> {
+        let revision = self.revision;
+        let other = self.side(side.other()).buffer.joined();
+        let options = self.options;
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let (bytes, info) = read()?;
+                    let document = TextDocument::decode(&bytes);
+                    let buffer = EditBuffer::from_document(&document);
+                    let mut syntax = DocumentSyntax::new(&syntax_path, &document);
+                    syntax.cover(buffer.lines());
+                    let other: Vec<&str> = other.split('\n').collect();
+                    let diff = match side {
+                        DiffSide::Left => LiveDiff::compute(buffer.lines(), &other, &options),
+                        DiffSide::Right => LiveDiff::compute(&other, buffer.lines(), &options),
+                    };
+                    let read_only = read_only_reason(&document);
+                    Ok::<_, E>(LoadedSide { buffer, syntax, info, read_only, diff, revision })
+                })
+                .await?;
+            this.update(cx, |this, cx| {
+                this.install_side(side, loaded, cx);
+                after(this, cx);
+                cx.notify();
+            })
+            .ok();
+            Ok(())
+        })
+    }
+
+    fn install_side(&mut self, side: DiffSide, loaded: LoadedSide, cx: &mut Context<Self>) {
+        let LoadedSide { buffer, syntax, info, read_only, diff, revision } = loaded;
+        let unchanged = self.revision == revision;
+        let columns = super::max_display_columns(&buffer);
         let state = self.side_mut(side);
-        state.buffer = EditBuffer::from_document(document);
-        state.syntax = DocumentSyntax::new(syntax_path, document);
-        state.syntax.cover(state.buffer.lines());
+        state.buffer = buffer;
+        state.syntax = syntax;
         state.history.reset();
-        state.read_only = read_only_reason(document);
+        state.read_only = read_only;
         state.info = info;
         state.marked = None;
         let head = state.buffer.clamp(state.selection.head);
         state.selection = super::side::Selection::caret(head);
 
         let [left, right] = &self.sides;
-        self.diff = LiveDiff::compute(left.buffer.lines(), right.buffer.lines(), &self.options);
+        // If the other side was edited while this one loaded, the prepared
+        // diff describes text that is gone.
+        self.diff = if unchanged {
+            diff
+        } else {
+            LiveDiff::compute(left.buffer.lines(), right.buffer.lines(), &self.options)
+        };
         self.identical = left.buffer.lines() == right.buffer.lines();
         self.list.reset(self.diff.rows().len());
+        self.horizontal.grow(columns);
         self.current_change = None;
+        self.notice = None;
+        self.invalidate_rows();
         self.revision += 1;
+        self.rediff = None;
         self.update_matches(false, cx);
-        cx.notify();
     }
 }
 

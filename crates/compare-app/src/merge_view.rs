@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use gpui::{
     AnyElement, AppContext, ClickEvent, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
     InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Pixels,
-    Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div, list,
-    px,
+    Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Window, div, list, px,
 };
 use gpui_component::IconName;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 
 use compare_core::{FileInfo, MergeDocument, OutputLine, Resolution, TextDocument};
 use compare_diff::MergeRegionKind;
@@ -55,6 +55,14 @@ pub struct MergeView {
     wrap: bool,
     /// Set when the inputs are a git conflict's stages rather than files.
     conflict: Option<GitConflict>,
+    /// True if a conflict was resolved since the result was last saved.
+    resolutions_unsaved: bool,
+    /// True if the output was edited by hand since it was last saved.
+    edits_unsaved: bool,
+    /// Counts changes to the result, so a save that finishes after a later
+    /// change does not mark that change as saved.
+    result_version: u64,
+    _editor_subscription: Option<Subscription>,
 }
 
 impl MergeView {
@@ -90,6 +98,10 @@ impl MergeView {
             message: None,
             wrap: false,
             conflict: None,
+            resolutions_unsaved: false,
+            edits_unsaved: false,
+            result_version: 0,
+            _editor_subscription: None,
         }
     }
 
@@ -124,6 +136,29 @@ impl MergeView {
         cx.notify();
     }
 
+    /// Returns true if closing the merge now would lose conflict
+    /// resolutions or manual edits that have not been saved.
+    pub fn has_unsaved_work(&self) -> bool {
+        self.resolutions_unsaved || self.edits_unsaved
+    }
+
+    /// Returns true if there are conflicts to step through.
+    pub fn has_differences(&self) -> bool {
+        !self.document.conflicts.is_empty()
+    }
+
+    /// Says that changed comparison options were not applied, because
+    /// merging again would discard the unsaved result.
+    pub fn note_options_not_applied(&mut self, cx: &mut Context<Self>) {
+        self.message = Some((
+            SharedString::from(
+                "Comparison options changed. Save the result, then Compare to merge again",
+            ),
+            theme::yellow(),
+        ));
+        cx.notify();
+    }
+
     /// One-line description for the status bar.
     pub fn summary(&self) -> String {
         format!(
@@ -143,14 +178,15 @@ impl MergeView {
     pub fn next_difference(&mut self, cx: &mut Context<Self>) {
         let count = self.document.conflicts.len();
         if count > 0 {
-            let next = self.selected_conflict.map_or(0, |c| (c + 1).min(count - 1));
+            let next = self.selected_conflict.map_or(0, |c| (c + 1) % count);
             self.select_conflict(next, cx);
         }
     }
 
     pub fn prev_difference(&mut self, cx: &mut Context<Self>) {
-        if !self.document.conflicts.is_empty() {
-            let prev = self.selected_conflict.map_or(0, |c| c.saturating_sub(1));
+        let count = self.document.conflicts.len();
+        if count > 0 {
+            let prev = self.selected_conflict.map_or(0, |c| (c + count - 1) % count);
             self.select_conflict(prev, cx);
         }
     }
@@ -194,6 +230,10 @@ impl MergeView {
             return;
         };
         let region = self.document.conflicts[conflict];
+        if self.document.resolutions[region] != resolution {
+            self.resolutions_unsaved = true;
+            self.result_version += 1;
+        }
         self.document.resolutions[region] = resolution;
         self.output = self.document.output_lines();
         let top = self.output_list.logical_scroll_top();
@@ -249,6 +289,7 @@ impl MergeView {
             }
             None => (self.document.merged_text(), self.document.unresolved_count()),
         };
+        let version = self.result_version;
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = receiver.await else {
                 return;
@@ -260,7 +301,7 @@ impl MergeView {
                     async move { std::fs::write(&path, text) }
                 })
                 .await;
-            let message = match write_result {
+            let message = match &write_result {
                 Ok(()) if unresolved > 0 => (
                     SharedString::from(format!(
                         "Saved {} with {unresolved} unresolved conflict(s) marked",
@@ -284,7 +325,12 @@ impl MergeView {
                     )
                 }
             };
+            let saved = write_result.is_ok();
             this.update(cx, |this, cx| {
+                if saved && this.result_version == version {
+                    this.resolutions_unsaved = false;
+                    this.edits_unsaved = false;
+                }
                 this.message = Some(message);
                 cx.notify();
             })
@@ -305,6 +351,13 @@ impl MergeView {
             state
         });
         editor.update(cx, |state, cx| state.focus(window, cx));
+        self._editor_subscription =
+            Some(cx.subscribe(&editor, |this, _, event: &InputEvent, _| {
+                if matches!(event, InputEvent::Change) {
+                    this.edits_unsaved = true;
+                    this.result_version += 1;
+                }
+            }));
         self.editor = Some(editor);
         self.message = Some((
             SharedString::from("Editing the merged output; resolution buttons are paused"),
@@ -316,6 +369,8 @@ impl MergeView {
     /// Drops manual edits and returns to the generated output.
     fn discard_edits(&mut self, cx: &mut Context<Self>) {
         self.editor = None;
+        self._editor_subscription = None;
+        self.edits_unsaved = false;
         self.message = None;
         cx.notify();
     }

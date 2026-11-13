@@ -241,7 +241,7 @@ impl TextDiffView {
 
     /// Replaces the current match (if it is on a side being replaced) and
     /// moves to the next one.
-    pub(super) fn replace_next(&mut self, cx: &mut Context<Self>) {
+    pub fn replace_next(&mut self, cx: &mut Context<Self>) {
         let Some((query, replacement, target)) = self.replace_inputs(cx) else {
             return;
         };
@@ -282,7 +282,7 @@ impl TextDiffView {
     }
 
     /// Replaces every match on the target sides, as one undo step per side.
-    pub(super) fn replace_all(&mut self, cx: &mut Context<Self>) {
+    pub fn replace_all(&mut self, cx: &mut Context<Self>) {
         let Some((query, replacement, target)) = self.replace_inputs(cx) else {
             return;
         };
@@ -296,11 +296,7 @@ impl TextDiffView {
             }
             let before = self.side(side).selection;
             // Work backwards so earlier positions stay valid.
-            let edits: Vec<_> = replacements
-                .into_iter()
-                .rev()
-                .map(|(range, text)| self.apply_edit(side, range, &text, cx))
-                .collect();
+            let edits = self.apply_edits(side, replacements.into_iter().rev().collect(), cx);
             let after = Selection::caret(self.side(side).buffer.clamp(before.head));
             let state = self.side_mut(side);
             state.selection = after;
@@ -360,6 +356,13 @@ impl TextDiffView {
                 .text_size(theme::ui_text_size())
         };
         let row = || div().flex().flex_row().items_start().gap(px(8.0));
+        // Replacing needs a match on a side that is both chosen and editable.
+        let can_replace =
+            ButtonState::enabled([DiffSide::Left, DiffSide::Right].iter().any(|&side| {
+                find.target.includes(side)
+                    && self.side(side).read_only.is_none()
+                    && !find.matches[side.index()].is_empty()
+            }));
 
         let find_controls = controls()
             .child(button::segmented(vec![
@@ -446,13 +449,13 @@ impl TextDiffView {
                     .child(button::action_button(
                         "Replace",
                         Box::new(ReplaceNext),
-                        ButtonState::Enabled,
+                        can_replace,
                         "Replace and find next (↩)",
                     ))
                     .child(button::action_button(
                         "Replace All",
                         Box::new(ReplaceAll),
-                        ButtonState::Enabled,
+                        can_replace,
                         "Replace all matches",
                     ))
                     .child(div().text_color(theme::muted()).child("in"))

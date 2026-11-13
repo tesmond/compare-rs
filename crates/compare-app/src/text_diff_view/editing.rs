@@ -8,7 +8,7 @@ use gpui::{
     point, px,
 };
 
-use compare_core::{DiffSide, Edit, EditBuffer, EditKind, Position};
+use compare_core::{DiffSide, Edit, EditBuffer, EditKind, LiveDiff, Position};
 
 use super::motion;
 use super::render::{CENTER_WIDTH, DIVIDER_WIDTH, GUTTER_WIDTH, MARKER_WIDTH, TEXT_PADDING};
@@ -79,8 +79,62 @@ impl TextDiffView {
         );
         self.list.splice(splice.old, splice.new_len);
         self.identical = false;
+        self.text_changed();
         self.schedule_rediff(REDIFF_DELAY, cx);
         Edit { start: range.start, old_text, new_text: text.to_owned() }
+    }
+
+    /// Applies several replacements to `side`, in order (each range refers
+    /// to the text as the earlier ones left it), then updates the syntax
+    /// state and diff once. Like [`Self::apply_edit`], this leaves the undo
+    /// history and selection alone.
+    ///
+    /// Patching the diff after every replacement costs time proportional to
+    /// the file for each one, which freezes the app when a command such as
+    /// Replace All makes thousands of them.
+    pub(super) fn apply_edits(
+        &mut self,
+        side: DiffSide,
+        edits: Vec<(Range<Position>, String)>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Edit> {
+        if let [(range, text)] = edits.as_slice() {
+            return vec![self.apply_edit(side, range.clone(), text, cx)];
+        }
+        let state = self.side_mut(side);
+        let mut applied = Vec::with_capacity(edits.len());
+        for (range, new_text) in edits {
+            let (start, end) = (state.buffer.clamp(range.start), state.buffer.clamp(range.end));
+            let range = if end < start { end..start } else { start..end };
+            let old_text = state.buffer.text_in(range.clone());
+            state.buffer.replace(range.clone(), &new_text);
+            applied.push(Edit { start: range.start, old_text, new_text });
+        }
+        if applied.is_empty() {
+            return applied;
+        }
+        state.syntax.rebuild(state.buffer.lines());
+        let columns = super::max_display_columns(&state.buffer);
+        self.horizontal.grow(columns);
+
+        let [left, right] = &self.sides;
+        self.diff = LiveDiff::compute(left.buffer.lines(), right.buffer.lines(), &self.options);
+        self.identical = left.buffer.lines() == right.buffer.lines();
+        let top = self.list.logical_scroll_top();
+        self.list.reset(self.diff.rows().len());
+        self.list.scroll_to(top);
+        // The diff is already complete, so drop any pending re-diff.
+        self.revision += 1;
+        self.rediff = None;
+        self.text_changed();
+        applied
+    }
+
+    /// Forgets what depends on the old text or rows.
+    fn text_changed(&mut self) {
+        self.invalidate_rows();
+        self.current_change = None;
+        self.notice = None;
     }
 
     /// Replaces `range` of `side` with `text` as one undoable edit and puts
@@ -148,9 +202,8 @@ impl TextDiffView {
         let Some(step) = self.side_mut(side).history.undo() else {
             return;
         };
-        for edit in step.edits.iter().rev() {
-            self.apply_edit(side, edit.new_range(), &edit.old_text, cx);
-        }
+        let edits = step.edits.iter().rev().map(|e| (e.new_range(), e.old_text.clone())).collect();
+        self.apply_edits(side, edits, cx);
         self.side_mut(side).selection = step.selection_before;
         self.reveal_cursor();
         self.update_matches(false, cx);
@@ -165,9 +218,8 @@ impl TextDiffView {
         let Some(step) = self.side_mut(side).history.redo() else {
             return;
         };
-        for edit in &step.edits {
-            self.apply_edit(side, edit.old_range(), &edit.new_text, cx);
-        }
+        let edits = step.edits.iter().map(|e| (e.old_range(), e.new_text.clone())).collect();
+        self.apply_edits(side, edits, cx);
         self.side_mut(side).selection = step.selection_after;
         self.reveal_cursor();
         self.update_matches(false, cx);

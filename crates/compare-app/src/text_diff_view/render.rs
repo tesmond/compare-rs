@@ -1,5 +1,7 @@
 //! Drawing the comparison: aligned rows of editable lines.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -12,6 +14,7 @@ use gpui::{
 
 use compare_core::{DiffSide, RowKind};
 use compare_diff::InlineDiff;
+use compare_syntax::Token;
 
 use super::TextDiffView;
 use super::editing::Motion;
@@ -64,6 +67,26 @@ const LINE_ARROW_WIDTH: f32 = 11.0;
 
 /// Group name for showing a row's line-copy arrows on hover.
 const ROW_GROUP: &str = "diff-row";
+
+/// Most rows kept in the row cache; a screenful is far fewer.
+const ROW_CACHE_LIMIT: usize = 512;
+
+/// What a row shows, which depends only on the text and the diff: each
+/// side's display text and syntax tokens, and the words that differ.
+///
+/// Rows are redrawn on every cursor move, selection drag, and scroll step,
+/// so this is kept between frames rather than worked out again each time.
+#[derive(Default)]
+pub(super) struct RowRender {
+    /// Display text of the left and right lines, where the row has them.
+    text: [Option<String>; 2],
+    /// Syntax tokens of each side's display text.
+    tokens: [Vec<Token>; 2],
+    inline: InlineDiff,
+}
+
+/// [`RowRender`]s by row index, cleared whenever the text or diff changes.
+pub(super) type RowCache = RefCell<HashMap<usize, Rc<RowRender>>>;
 
 /// A copy arrow in the center column.
 struct CopyArrow {
@@ -129,12 +152,47 @@ fn divider() -> Div {
 /// How one side of a row is drawn.
 struct CellStyle<'a> {
     background: Hsla,
+    /// Syntax tokens of the display text.
+    tokens: &'a [Token],
     /// Changed words, as byte ranges of the display text.
     emphasis: &'a [Range<usize>],
     emphasis_color: Hsla,
 }
 
 impl TextDiffView {
+    /// Drops every cached row, after the text, syntax, or diff changed.
+    pub(super) fn invalidate_rows(&self) {
+        self.row_cache.borrow_mut().clear();
+    }
+
+    /// What row `index` shows, from the cache when it has been drawn since
+    /// the last change.
+    fn row_render(&self, index: usize) -> Rc<RowRender> {
+        if let Some(cached) = self.row_cache.borrow().get(&index) {
+            return cached.clone();
+        }
+        let row = self.diff.rows()[index];
+        let mut render = RowRender::default();
+        for side in [DiffSide::Left, DiffSide::Right] {
+            if let Some(line) = side.line_of(row) {
+                let state = self.side(side);
+                let text = format::display_line(state.buffer.line(line as usize));
+                render.tokens[side.index()] = state.syntax.tokens(line as usize, &text);
+                render.text[side.index()] = Some(text);
+            }
+        }
+        if let ([Some(left), Some(right)], RowKind::Changed) = (&render.text, row.kind) {
+            render.inline = compare_diff::diff_inline(left, right);
+        }
+        let render = Rc::new(render);
+        let mut cache = self.row_cache.borrow_mut();
+        if cache.len() >= ROW_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(index, render.clone());
+        render
+    }
+
     fn render_row(
         &mut self,
         index: usize,
@@ -142,15 +200,9 @@ impl TextDiffView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let row = self.diff.rows()[index];
-        let display = |side: DiffSide| {
-            side.line_of(row)
-                .map(|line| format::display_line(self.side(side).buffer.line(line as usize)))
-        };
-        let (left_text, right_text) = (display(DiffSide::Left), display(DiffSide::Right));
-        let inline = match (&left_text, &right_text) {
-            (Some(l), Some(r)) if row.kind == RowKind::Changed => compare_diff::diff_inline(l, r),
-            _ => InlineDiff::default(),
-        };
+        let render = self.row_render(index);
+        let [left_text, right_text] = render.text.clone();
+        let inline = &render.inline;
         let (left_bg, right_bg) = match row.kind {
             RowKind::Equal => (theme::base(), theme::base()),
             RowKind::Changed => (theme::deleted_bg(), theme::inserted_bg()),
@@ -166,6 +218,7 @@ impl TextDiffView {
             index,
             left_text,
             CellStyle {
+                tokens: &render.tokens[0],
                 background: left_bg,
                 emphasis: &inline.left,
                 emphasis_color: theme::deleted_emphasis(),
@@ -178,6 +231,7 @@ impl TextDiffView {
             index,
             right_text,
             CellStyle {
+                tokens: &render.tokens[1],
                 background: right_bg,
                 emphasis: &inline.right,
                 emphasis_color: theme::inserted_emphasis(),
@@ -373,7 +427,6 @@ impl TextDiffView {
     ) -> EditorLine {
         let state = self.side(side);
         let text = state.buffer.line(line);
-        let tokens = state.syntax.tokens(line, &display);
         let mut marks: Vec<Mark> = style
             .emphasis
             .iter()
@@ -437,7 +490,7 @@ impl TextDiffView {
             marks.push(Mark::underline(range, theme::text()));
         }
 
-        let mut element = EditorLine::new(code_text::code_text(display, &tokens, &marks));
+        let mut element = EditorLine::new(code_text::code_text(display, style.tokens, &marks));
         if has_cursor && focused {
             element = element.cursor(format::to_display_offset(text, head.column), theme::cursor());
         }
@@ -531,7 +584,7 @@ impl TextDiffView {
                     ButtonState::enabled(modified && state.path.is_some()),
                     cx.listener(move |this, _: &ClickEvent, window, cx| {
                         window.focus(&this.focus);
-                        this.revert(side, cx);
+                        this.request_revert(side, window, cx);
                     }),
                 ),
                 button::Hint::text("Discard unsaved changes to this side"),
@@ -596,7 +649,9 @@ impl TextDiffView {
             let buffer = &self.side(side).buffer;
             buffer.len() == 1 && buffer.line(0).is_empty()
         };
-        if blank(DiffSide::Left) && blank(DiffSide::Right) {
+        if let Some(notice) = &self.notice {
+            Some(file_header::banner(notice.clone(), theme::red()))
+        } else if blank(DiffSide::Left) && blank(DiffSide::Right) {
             Some(file_header::banner(
                 "Type or paste text on each side to compare it · ⌘⇧B beautifies JSON, dicts, and \\n",
                 theme::subtext(),

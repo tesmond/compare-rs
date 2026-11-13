@@ -72,6 +72,8 @@ pub struct FolderDiffView {
     hidden_differences: Vec<usize>,
     /// Each node's folder, if it is not at the top level.
     parents: Vec<Option<usize>>,
+    /// Each node's name in lower case, for sorting without regard to case.
+    sort_names: Vec<String>,
     selected: Option<usize>,
     sort: SortColumn,
     ascending: bool,
@@ -102,6 +104,8 @@ impl FolderDiffView {
                 parents[child] = Some(index);
             }
         }
+        let sort_names = comparison.nodes.iter().map(|node| node.name.to_lowercase()).collect();
+        let hidden_differences = difference_counts(&comparison);
         let mut view = Self {
             focus: cx.focus_handle(),
             comparison,
@@ -109,8 +113,9 @@ impl FolderDiffView {
             right_label,
             expanded,
             visible: Vec::new(),
-            hidden_differences: Vec::new(),
+            hidden_differences,
             parents,
+            sort_names,
             selected: None,
             sort: SortColumn::Name,
             ascending: true,
@@ -124,6 +129,7 @@ impl FolderDiffView {
     /// Re-checks the file pair that includes `path` after it was saved.
     pub fn refresh_file(&mut self, path: &Path, cx: &mut Context<Self>) {
         if self.comparison.refresh_file(path) {
+            self.hidden_differences = difference_counts(&self.comparison);
             self.rebuild_visible();
             cx.notify();
         }
@@ -157,6 +163,12 @@ impl FolderDiffView {
         paths
     }
 
+    /// Returns true if any entry differs between the folders.
+    pub fn has_differences(&self) -> bool {
+        let stats = self.comparison.stats;
+        stats.different + stats.left_only + stats.right_only + stats.errors > 0
+    }
+
     /// Selects the next entry that is not identical.
     pub fn next_difference(&mut self, cx: &mut Context<Self>) {
         self.select_difference(true, cx);
@@ -168,7 +180,8 @@ impl FolderDiffView {
     }
 
     /// Selects the next (or previous) differing file in tree order,
-    /// including files inside collapsed folders, which are opened to show it.
+    /// including files inside collapsed folders, which are opened to show
+    /// it. Wraps around at either end.
     fn select_difference(&mut self, forward: bool, cx: &mut Context<Self>) {
         let mut order = Vec::with_capacity(self.comparison.nodes.len());
         let roots = self.sorted(&self.comparison.roots);
@@ -180,10 +193,11 @@ impl FolderDiffView {
         };
         let found = if forward {
             let start = position.map_or(0, |p| p + 1);
-            order[start.min(order.len())..].iter().find(is_difference).copied()
+            let start = start.min(order.len());
+            order[start..].iter().chain(&order[..start]).find(is_difference).copied()
         } else {
             let end = position.unwrap_or(order.len());
-            order[..end].iter().rev().find(is_difference).copied()
+            order[..end].iter().rev().chain(order[end..].iter().rev()).find(is_difference).copied()
         };
         let Some(node) = found else {
             return;
@@ -226,7 +240,6 @@ impl FolderDiffView {
     }
 
     fn rebuild_visible(&mut self) {
-        self.hidden_differences = difference_counts(&self.comparison);
         let mut visible = Vec::with_capacity(self.visible.len().max(self.comparison.roots.len()));
         let roots = self.sorted(&self.comparison.roots);
         self.push_visible(&roots, &mut visible);
@@ -251,6 +264,7 @@ impl FolderDiffView {
         let mut sorted = nodes.to_vec();
         let nodes = &self.comparison.nodes;
         sorted.sort_by(|&a, &b| {
+            let by_name = self.sort_names[a].cmp(&self.sort_names[b]);
             let (a, b) = (&nodes[a], &nodes[b]);
             // Folders always stay above files.
             let by_kind = b.is_dir().cmp(&a.is_dir());
@@ -260,7 +274,6 @@ impl FolderDiffView {
                 SortColumn::Modified => latest_time(a).cmp(&latest_time(b)),
             };
             let by_column = if self.ascending { by_column } else { by_column.reverse() };
-            let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
             let by_name = if self.sort == SortColumn::Name && !self.ascending {
                 by_name.reverse()
             } else {

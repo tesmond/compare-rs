@@ -20,8 +20,9 @@ use compare_core::{
 use crate::actions::{
     Beautify, CloseTab, Compare, CompareFolders, CopyPaths, FindNext, FindPrev, Merge, NewTab,
     NewTextCompare, NextDifference, NextTab, OpenFind, OpenFolderLeft, OpenFolderRight,
-    OpenGitHistory, OpenLeft, OpenReplace, OpenRight, PrevDifference, PrevTab, Quit, RevertFile,
-    SaveAll, SaveFile, ToggleIgnoreCase, ToggleIgnoreWhitespace, ToggleWordWrap,
+    OpenGitHistory, OpenLeft, OpenReplace, OpenRight, PrevDifference, PrevTab, Quit, ReplaceAll,
+    ReplaceNext, RevertFile, SaveAll, SaveFile, ToggleIgnoreCase, ToggleIgnoreWhitespace,
+    ToggleWordWrap,
 };
 use crate::app_assets;
 use crate::button::{self, ButtonState, Content, Segment};
@@ -221,9 +222,70 @@ impl Workspace {
         self.text_view(index).is_some_and(|view| view.read(cx).is_modified())
     }
 
+    /// The merge shown in the tab at `index`, if any.
+    fn merge_view(&self, index: usize) -> Option<&Entity<MergeView>> {
+        match &self.tabs.get(index)?.content {
+            TabContent::Merge(view) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// Returns true if the tab at `index` shows a merge whose resolutions
+    /// or edited output have not been saved.
+    fn merge_is_unsaved(&self, index: usize, cx: &App) -> bool {
+        self.merge_view(index).is_some_and(|view| view.read(cx).has_unsaved_work())
+    }
+
+    /// Returns true if replacing the content of the tab at `index` would
+    /// lose work: unsaved edits, or an unsaved merge result.
+    fn tab_has_unsaved_work(&self, index: usize, cx: &App) -> bool {
+        self.tab_is_modified(index, cx) || self.merge_is_unsaved(index, cx)
+    }
+
+    /// The tab that new inputs for the tab at `index` should go to: that
+    /// tab, or a copy of its inputs in a new tab when re-comparing it would
+    /// lose unsaved work.
+    fn tab_for_new_inputs(&mut self, index: usize, cx: &mut Context<Self>) -> usize {
+        if !self.tab_has_unsaved_work(index, cx) {
+            return index;
+        }
+        let (kind, inputs) = {
+            let tab = &self.tabs[index];
+            (tab.kind, [tab.left.clone(), tab.base.clone(), tab.right.clone()])
+        };
+        let id = self.add_tab(kind, cx);
+        let index = self.tab_index(id).expect("tab was just added");
+        let tab = &mut self.tabs[index];
+        [tab.left, tab.base, tab.right] = inputs;
+        index
+    }
+
     /// Closes the tab at `index`, first asking whether to save any unsaved
     /// edits.
     fn request_close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.merge_is_unsaved(index, cx) {
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                "Close this merge without saving its result?",
+                Some("Your conflict resolutions and edits to the merged output will be lost."),
+                &["Close", "Cancel"],
+                cx,
+            );
+            let tab_id = self.tabs[index].id;
+            cx.spawn(async move |this, cx| {
+                if answer.await != Ok(0) {
+                    return;
+                }
+                this.update(cx, |this, cx| {
+                    if let Some(index) = this.tab_index(tab_id) {
+                        this.close_tab(index, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let Some(view) = self.text_view(index).filter(|view| view.read(cx).is_modified()).cloned()
         else {
             self.close_tab(index, cx);
@@ -268,7 +330,8 @@ impl Workspace {
             .filter(|&index| self.tab_is_modified(index, cx))
             .filter_map(|index| self.text_view(index).cloned())
             .collect();
-        if views.is_empty() {
+        let merges = (0..self.tabs.len()).filter(|&index| self.merge_is_unsaved(index, cx)).count();
+        if views.is_empty() && merges == 0 {
             cx.quit();
             return;
         }
@@ -278,29 +341,58 @@ impl Workspace {
             [one] => format!("Save changes to {one} before quitting?"),
             many => format!("Save changes to {} files before quitting?", many.len()),
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &message,
-            Some("Your changes will be lost if you don't save them."),
-            &["Save All", "Don't Save", "Cancel"],
-            cx,
-        );
+        let merge_message = match merges {
+            1 => "Quit without saving a merge result?".to_owned(),
+            count => format!("Quit without saving {count} merge results?"),
+        };
         cx.spawn_in(window, async move |_, cx| {
-            match answer.await {
-                Ok(0) => {
-                    for view in views {
-                        let Ok(save) =
-                            view.update_in(cx, |view, window, cx| view.save_all(window, cx))
-                        else {
-                            return;
-                        };
-                        if !save.await {
-                            return;
+            if merges > 0 {
+                let Ok(answer) = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        &merge_message,
+                        Some(
+                            "Conflict resolutions and edits to merged output that have not \
+                             been saved will be lost.",
+                        ),
+                        &["Quit Anyway", "Cancel"],
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                if answer.await != Ok(0) {
+                    return;
+                }
+            }
+            if !views.is_empty() {
+                let Ok(answer) = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        &message,
+                        Some("Your changes will be lost if you don't save them."),
+                        &["Save All", "Don't Save", "Cancel"],
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                match answer.await {
+                    Ok(0) => {
+                        for view in views {
+                            let Ok(save) =
+                                view.update_in(cx, |view, window, cx| view.save_all(window, cx))
+                            else {
+                                return;
+                            };
+                            if !save.await {
+                                return;
+                            }
                         }
                     }
+                    Ok(1) => {}
+                    _ => return,
                 }
-                Ok(1) => {}
-                _ => return,
             }
             cx.update(|_, cx| cx.quit()).ok();
         })
@@ -310,7 +402,7 @@ impl Workspace {
     /// Returns true if the window may close now; otherwise asks about
     /// unsaved edits first (and quits once they are dealt with).
     pub fn confirm_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let modified = (0..self.tabs.len()).any(|index| self.tab_is_modified(index, cx));
+        let modified = (0..self.tabs.len()).any(|index| self.tab_has_unsaved_work(index, cx));
         if modified {
             self.request_quit(window, cx);
         }
@@ -355,9 +447,23 @@ impl Workspace {
         }
     }
 
-    fn on_revert_file(&mut self, _: &RevertFile, _: &mut Window, cx: &mut Context<Self>) {
+    /// Clicking the Replace buttons takes keyboard focus away from the
+    /// comparison, so their actions arrive here rather than at the view.
+    fn on_replace_next(&mut self, _: &ReplaceNext, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.text_view(self.active).cloned() {
-            view.update(cx, |view, cx| view.revert_active(cx));
+            view.update(cx, |view, cx| view.replace_next(cx));
+        }
+    }
+
+    fn on_replace_all(&mut self, _: &ReplaceAll, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.replace_all(cx));
+        }
+    }
+
+    fn on_revert_file(&mut self, _: &RevertFile, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.text_view(self.active).cloned() {
+            view.update(cx, |view, cx| view.revert_active(window, cx));
         }
     }
 
@@ -390,20 +496,11 @@ impl Workspace {
 
     /// Fills an input slot of a tab and starts comparing once all are filled.
     fn set_tab_path(&mut self, tab_id: u64, side: Side, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(mut index) = self.tab_index(tab_id) else {
+        let Some(index) = self.tab_index(tab_id) else {
             return;
         };
-        if self.tab_is_modified(index, cx) {
-            // Keep the unsaved edits: compare the new file in a new tab.
-            let (kind, inputs) = {
-                let tab = &self.tabs[index];
-                (tab.kind, [tab.left.clone(), tab.base.clone(), tab.right.clone()])
-            };
-            let id = self.add_tab(kind, cx);
-            index = self.tab_index(id).expect("tab was just added");
-            let tab = &mut self.tabs[index];
-            [tab.left, tab.base, tab.right] = inputs;
-        }
+        // Keep unsaved work: compare the new file in a new tab.
+        let index = self.tab_for_new_inputs(index, cx);
         self.tabs[index].set_path(side, path);
         if self.tabs[index].is_ready() {
             self.start_compare(index, cx);
@@ -418,6 +515,11 @@ impl Workspace {
         let Some(index) = self.tab_index(tab_id) else {
             return;
         };
+        if paths.is_empty() {
+            return;
+        }
+        // Keep unsaved work: compare the dropped files in a new tab.
+        let index = self.tab_for_new_inputs(index, cx);
         let tab = &mut self.tabs[index];
         match (paths, side) {
             ([left, right], None) if tab.kind == TabKind::Compare => {
@@ -779,10 +881,37 @@ impl Workspace {
         self.compare_active(cx);
     }
 
-    fn compare_active(&mut self, cx: &mut Context<Self>) {
+    /// Why Compare cannot run on the active tab right now, if it cannot.
+    fn compare_blocked(&self, cx: &App) -> Option<&'static str> {
+        let tab = self.active_tab()?;
+        if tab.kind == TabKind::Text {
+            return Some("Pasted text is compared as you type");
+        }
         if self.tab_is_modified(self.active, cx) {
             // Edited text is re-diffed as it changes; re-reading the files
             // would discard the edits.
+            return Some("Save or revert your changes before comparing again");
+        }
+        if self.merge_is_unsaved(self.active, cx) {
+            return Some("Save the merged result before comparing again");
+        }
+        None
+    }
+
+    /// Returns true if the active tab shows something Next and Previous
+    /// Difference can move through.
+    fn has_differences(&self, cx: &App) -> bool {
+        match self.active_tab().map(|tab| &tab.content) {
+            Some(TabContent::Text(view)) => view.read(cx).has_differences(),
+            Some(TabContent::Binary(view)) => view.read(cx).has_differences(),
+            Some(TabContent::Folder(view)) => view.read(cx).has_differences(),
+            Some(TabContent::Merge(view)) => view.read(cx).has_differences(),
+            _ => false,
+        }
+    }
+
+    fn compare_active(&mut self, cx: &mut Context<Self>) {
+        if self.compare_blocked(cx).is_some() {
             return;
         }
         if let Some(tab) = self.active_tab() {
@@ -1062,7 +1191,15 @@ impl Workspace {
                 TabContent::Text(view) => {
                     view.update(cx, |view, cx| view.set_options(options.diff, cx));
                 }
-                TabContent::Merge(_) => self.start_compare(index, cx),
+                TabContent::Merge(view) => {
+                    // Re-merging would discard unsaved resolutions and edits.
+                    let view = view.clone();
+                    if view.read(cx).has_unsaved_work() {
+                        view.update(cx, |view, cx| view.note_options_not_applied(cx));
+                    } else {
+                        self.start_compare(index, cx);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1179,11 +1316,12 @@ impl Workspace {
     }
 
     /// The toolbar: what to compare, what to do, and how to show it.
-    fn render_toolbar(&self) -> Div {
+    fn render_toolbar(&self, cx: &App) -> Div {
+        let compare_blocked = self.compare_blocked(cx);
         let can_compare = ButtonState::enabled(
-            self.active_tab().is_some_and(|tab| tab.is_ready() || tab.kind == TabKind::Text),
+            compare_blocked.is_none() && self.active_tab().is_some_and(Tab::is_ready),
         );
-        let has_tab = ButtonState::enabled(!self.tabs.is_empty());
+        let has_differences = ButtonState::enabled(self.has_differences(cx));
         let has_text = ButtonState::enabled(self.text_view(self.active).is_some());
         let group = || div().flex().flex_row().flex_none().items_center().gap(px(6.0));
         let open = |content: Content, action: Box<dyn gpui::Action>, hint: &'static str| {
@@ -1228,7 +1366,7 @@ impl Workspace {
                 "Compare",
                 Box::new(Compare),
                 can_compare,
-                "Compare",
+                compare_blocked.unwrap_or("Compare"),
             ))
             .child(button::action_button(
                 "Merge…",
@@ -1240,13 +1378,13 @@ impl Workspace {
                 Segment::action(
                     IconName::ArrowUp,
                     Box::new(PrevDifference),
-                    has_tab,
+                    has_differences,
                     "Previous difference",
                 ),
                 Segment::action(
                     IconName::ArrowDown,
                     Box::new(NextDifference),
-                    has_tab,
+                    has_differences,
                     "Next difference",
                 ),
             ]));
@@ -1421,7 +1559,7 @@ impl Workspace {
                     .min_w_0()
                     .truncate()
                     .text_size(theme::summary_text_size())
-                    .text_color(if color == theme::muted() { color } else { theme::subtext() })
+                    .text_color(color)
                     .child(summary),
             )
             .child(
@@ -1487,6 +1625,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_replace))
             .on_action(cx.listener(Self::on_find_next))
             .on_action(cx.listener(Self::on_find_prev))
+            .on_action(cx.listener(Self::on_replace_next))
+            .on_action(cx.listener(Self::on_replace_all))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
             .on_action(cx.listener(Self::on_next_difference))
@@ -1503,7 +1643,7 @@ impl Render for Workspace {
             .bg(theme::base())
             .text_color(theme::text())
             .child(self.render_tab_bar(cx))
-            .child(self.render_toolbar())
+            .child(self.render_toolbar(cx))
             .children(path_bar)
             .child(
                 div()

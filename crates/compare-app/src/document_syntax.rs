@@ -69,6 +69,13 @@ impl DocumentSyntax {
         self.recompute_from(highlighter, start, start + change.new_count, lines);
     }
 
+    /// Recomputes every line state, after changes too widespread to patch.
+    pub fn rebuild(&mut self, lines: &[String]) {
+        if let Some(highlighter) = self.highlighter {
+            self.line_states = highlighter.line_states(lines.iter().map(String::as_str));
+        }
+    }
+
     /// Recomputes states after line `start`, at least up to `must_reach`,
     /// then until they agree with the stored ones.
     fn recompute_from(

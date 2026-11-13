@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use gpui::{Context, Task};
 
-use compare_core::{BlameLine, DiffSide, FileVersion, GitFile, TextDocument};
+use compare_core::{BlameLine, DiffSide, FileVersion, GitFile};
 
 use super::TextDiffView;
 use crate::crash_log;
@@ -110,37 +110,44 @@ impl TextDiffView {
         if self.step_blocked(side).is_some() {
             return;
         }
-        let Some(git) = &mut self.git else {
+        let Some(file) = self.git.as_ref().map(|git| git.file.clone()) else {
             return;
         };
-        let file = git.file.clone();
-        git.loading = Some(cx.spawn(async move |this, cx| {
-            let read = cx
-                .background_executor()
-                .spawn({
-                    let file = file.clone();
-                    async move { file.read(target) }
-                })
-                .await;
-            this.update(cx, |this, cx| match read {
-                Ok(bytes) => {
-                    let document = TextDocument::decode(&bytes);
-                    let info = file.version_info(target, bytes.len() as u64);
-                    this.replace_side(side, &document, file.path(), info, cx);
-                    this.describe_version(side, &file, target, bytes.len() as u64);
-                    if let Some(git) = &mut this.git {
-                        git.shown[side.index()] = target;
-                        git.loading = None;
-                        git.blame[side.index()] = Blame::NotLoaded;
-                    }
+        let load = self.load_side(
+            side,
+            file.path().to_path_buf(),
+            {
+                let file = file.clone();
+                move || {
+                    file.read(target).map(|bytes| {
+                        let info = file.version_info(target, bytes.len() as u64);
+                        (bytes, info)
+                    })
+                }
+            },
+            move |this, _| {
+                let size = this.side(side).info.size;
+                this.describe_version(side, &file, target, size);
+                if let Some(git) = &mut this.git {
+                    git.shown[side.index()] = target;
+                    git.blame[side.index()] = Blame::NotLoaded;
+                }
+            },
+            cx,
+        );
+        let task = cx.spawn(async move |this, cx| {
+            if let Err(error) = load.await {
+                crash_log::record_error("Reading a git version", &error.to_string());
+                this.update(cx, |this, cx| {
+                    this.notice = Some(format!("Could not read that version: {error}").into());
                     cx.notify();
-                }
-                Err(error) => {
-                    crash_log::record_error("Reading a git version", &error.to_string());
-                }
-            })
-            .ok();
-        }));
+                })
+                .ok();
+            }
+        });
+        if let Some(git) = &mut self.git {
+            git.loading = Some(task);
+        }
     }
 
     /// Starts loading the blame of any side that does not have it yet.

@@ -26,7 +26,7 @@ use gpui::{
 };
 
 use compare_core::{
-    DiffOptions, DiffSide, EditBuffer, Encoding, FileInfo, LiveDiff, RowKind, TextDiff,
+    DiffOptions, DiffSide, EditBuffer, Encoding, FileInfo, LiveDiff, Position, RowKind, TextDiff,
     TextDocument,
 };
 
@@ -55,6 +55,16 @@ pub struct TextDiffView {
     horizontal: HorizontalScroll,
     /// Index into the diff's change starts of the change last navigated to.
     current_change: Option<usize>,
+    /// Where navigating to that change left the cursor. While the cursor is
+    /// still there, Next and Previous step from that change; once it has
+    /// moved, they step from the cursor instead.
+    change_cursor: Option<(DiffSide, Position)>,
+    /// A problem to show above the text, such as a file that could not be
+    /// reloaded.
+    notice: Option<SharedString>,
+    /// What each recently drawn row shows, kept until the text or diff
+    /// changes.
+    row_cache: render::RowCache,
     /// False for pasted text, whose "paths" are only labels.
     file_backed: bool,
     wrap: bool,
@@ -110,6 +120,9 @@ impl TextDiffView {
             list,
             horizontal: HorizontalScroll::new(max_columns),
             current_change: None,
+            change_cursor: None,
+            notice: None,
+            row_cache: render::RowCache::default(),
             file_backed: true,
             wrap: false,
             identical,
@@ -180,10 +193,13 @@ impl TextDiffView {
         if self.identical {
             return format!("Identical · {lines} lines");
         }
-        let differences = match self.diff.change_count() {
-            0 => "Only ignored differences (whitespace, case, or line endings)".to_owned(),
-            1 => "1 difference".to_owned(),
-            count => format!("{count} differences"),
+        let differences = match (self.diff.change_count(), self.current_change) {
+            (0, _) => "Only ignored differences (whitespace, case, or line endings)".to_owned(),
+            (count, Some(current)) if current < count => {
+                format!("Difference {} of {count}", current + 1)
+            }
+            (1, _) => "1 difference".to_owned(),
+            (count, _) => format!("{count} differences"),
         };
         match self.sides[0].syntax.language_name() {
             Some(language) => format!("{differences} · {language}"),
@@ -191,23 +207,47 @@ impl TextDiffView {
         }
     }
 
-    /// Moves to the next changed region.
+    /// Returns true if any lines differ (under the current options).
+    pub fn has_differences(&self) -> bool {
+        self.diff.has_changes()
+    }
+
+    /// Moves to the next changed region, wrapping to the first.
     pub fn next_difference(&mut self, cx: &mut Context<Self>) {
+        self.step_difference(true, cx);
+    }
+
+    /// Moves to the previous changed region, wrapping to the last.
+    pub fn prev_difference(&mut self, cx: &mut Context<Self>) {
+        self.step_difference(false, cx);
+    }
+
+    fn step_difference(&mut self, forward: bool, cx: &mut Context<Self>) {
         let count = self.diff.change_count();
         if count == 0 {
             return;
         }
-        let next = self.current_change.map_or(0, |current| (current + 1).min(count - 1));
-        self.go_to_change(next, cx);
-    }
-
-    /// Moves to the previous changed region.
-    pub fn prev_difference(&mut self, cx: &mut Context<Self>) {
-        if self.diff.change_count() == 0 {
-            return;
-        }
-        let prev = self.current_change.map_or(0, |current| current.saturating_sub(1));
-        self.go_to_change(prev, cx);
+        let head = self.sides[self.active.index()].selection.head;
+        let current = self.current_change.filter(|&current| current < count);
+        let stepping = current.filter(|_| self.change_cursor == Some((self.active, head)));
+        let target = match stepping {
+            Some(current) if forward => (current + 1) % count,
+            Some(current) => (current + count - 1) % count,
+            // The cursor has moved since the last step: go by where it is.
+            None => {
+                let row = self.diff.row_of_line(self.active, head.line);
+                let at_or_after = self.diff.change_starts().partition_point(|&start| start < row);
+                if forward {
+                    // A change starting on the cursor's row counts as next,
+                    // unless it is the one already marked.
+                    let skip = usize::from(current == Some(at_or_after));
+                    (at_or_after + skip) % count
+                } else {
+                    (at_or_after + count - 1) % count
+                }
+            }
+        };
+        self.go_to_change(target, cx);
     }
 
     /// Scrolls a change into view (with a little context above it) and puts
@@ -218,7 +258,9 @@ impl TextDiffView {
         self.list.scroll_to(ListOffset { item_ix: row.saturating_sub(3), offset_in_item: px(0.0) });
         let line = self.diff.lines_before_row(self.active, row);
         let line = line.min(self.sides[self.active.index()].buffer.len() - 1);
-        self.set_cursor(compare_core::Position::new(line, 0));
+        self.set_cursor(Position::new(line, 0));
+        let head = self.sides[self.active.index()].selection.head;
+        self.change_cursor = Some((self.active, head));
         cx.notify();
     }
 
@@ -277,15 +319,15 @@ impl TextDiffView {
             left.or(row.right.map(|line| (DiffSide::Right, line)))
         });
         self.diff = diff;
+        self.invalidate_rows();
+        // The changes may have been renumbered.
+        self.current_change = None;
         let rows = self.diff.rows().len();
         self.list.reset(rows);
         let item_ix = anchor.map_or(top.item_ix.min(rows), |(side, line)| {
             self.diff.row_of_line(side, line as usize)
         });
         self.list.scroll_to(ListOffset { item_ix, offset_in_item: top.offset_in_item });
-        if self.current_change.is_some_and(|change| change >= self.diff.change_count()) {
-            self.current_change = None;
-        }
         cx.notify();
     }
 }

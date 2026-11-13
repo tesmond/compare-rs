@@ -42,6 +42,41 @@ impl BinaryDiff {
         Self { left, right, differing_bytes, differing_rows }
     }
 
+    /// Index into `differing_rows` of the start of the run of adjacent
+    /// differing rows after the one holding `current`, wrapping to the
+    /// first run. `None` if nothing differs.
+    pub fn next_run(&self, current: Option<usize>) -> Option<usize> {
+        let rows = &self.differing_rows;
+        if rows.is_empty() {
+            return None;
+        }
+        let Some(mut end) = current.filter(|&current| current < rows.len()) else {
+            return Some(0);
+        };
+        while end + 1 < rows.len() && rows[end + 1] == rows[end] + 1 {
+            end += 1;
+        }
+        Some((end + 1) % rows.len())
+    }
+
+    /// Like [`BinaryDiff::next_run`], for the run before the one holding
+    /// `current`, wrapping to the last run.
+    pub fn prev_run(&self, current: Option<usize>) -> Option<usize> {
+        let rows = &self.differing_rows;
+        let last = rows.len().checked_sub(1)?;
+        let run_start = |mut index: usize| {
+            while index > 0 && rows[index - 1] + 1 == rows[index] {
+                index -= 1;
+            }
+            index
+        };
+        let before = match current.filter(|&current| current <= last).map(run_start) {
+            None | Some(0) => last,
+            Some(start) => start - 1,
+        };
+        Some(run_start(before))
+    }
+
     /// Number of hex rows needed to show the longer side.
     pub fn row_count(&self) -> usize {
         self.left.len().max(self.right.len()).div_ceil(BYTES_PER_ROW)
@@ -68,6 +103,22 @@ mod tests {
         assert_eq!(diff.differing_bytes, 2);
         assert_eq!(diff.differing_rows, [0, 1]);
         assert_eq!(diff.row_count(), 3);
+    }
+
+    #[test]
+    fn steps_between_runs_of_differing_rows() {
+        let diff = BinaryDiff { differing_rows: vec![2, 3, 4, 9, 20, 21], ..Default::default() };
+        assert_eq!(diff.next_run(None), Some(0));
+        assert_eq!(diff.next_run(Some(0)), Some(3));
+        assert_eq!(diff.next_run(Some(1)), Some(3));
+        assert_eq!(diff.next_run(Some(3)), Some(4));
+        assert_eq!(diff.next_run(Some(4)), Some(0));
+        assert_eq!(diff.prev_run(None), Some(4));
+        assert_eq!(diff.prev_run(Some(5)), Some(3));
+        assert_eq!(diff.prev_run(Some(3)), Some(0));
+        assert_eq!(diff.prev_run(Some(1)), Some(4));
+        assert_eq!(BinaryDiff::default().next_run(None), None);
+        assert_eq!(BinaryDiff::default().prev_run(None), None);
     }
 
     #[test]

@@ -180,14 +180,25 @@ impl FolderComparison {
     /// it changed, updating its status, the counts, and the status of the
     /// folders above it. Returns true if a matching pair was found.
     pub fn refresh_file(&mut self, path: &Path) -> bool {
+        // Resolving every node's paths to find the file would cost two
+        // file-system calls per node; instead resolve only `path` and the
+        // roots, and look the node up by its path below a root.
         let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let target = canonical(path);
-        let Some(index) = (0..self.nodes.len()).find(|&index| {
-            let node = &self.nodes[index];
-            node.is_file_pair()
-                && (canonical(&self.left_path(node)) == target
-                    || canonical(&self.right_path(node)) == target)
-        }) else {
+        let relative = [&self.left_root, &self.right_root].into_iter().find_map(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .map(Path::to_path_buf)
+                .or_else(|| target.strip_prefix(canonical(root)).ok().map(Path::to_path_buf))
+        });
+        let Some(relative) = relative else {
+            return false;
+        };
+        let Some(index) = self
+            .nodes
+            .iter()
+            .position(|node| node.is_file_pair() && node.relative_path == relative)
+        else {
             return false;
         };
         let (left_path, right_path) =
